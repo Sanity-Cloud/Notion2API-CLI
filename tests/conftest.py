@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+import os
+
 import pytest
+
+
+# Test modules import app.config during collection, before fixtures execute.
+# Seed security/tool-namespace variables with explicit empty values so the live
+# repository .env cannot alter auth or MCP tool names during test imports.
+os.environ["API_KEY"] = ""
+os.environ["MCP_TOOL_PREFIX"] = ""
+os.environ["ENABLE_ATTACHMENTS"] = "false"
 
 
 @pytest.fixture(autouse=True)
@@ -13,6 +23,11 @@ def isolate_notion_runtime_state(tmp_path, monkeypatch):
     from app.notion_request_telemetry import NotionRequestTelemetryStore
 
     database = tmp_path / "notion-runtime-state.sqlite3"
+    # Keep the import-time isolation in force for code that consults the
+    # environment dynamically after collection.
+    monkeypatch.setenv("API_KEY", "")
+    monkeypatch.setenv("MCP_TOOL_PREFIX", "")
+    monkeypatch.setenv("ENABLE_ATTACHMENTS", "false")
     monkeypatch.setenv("NOTION_MODEL_CATALOG_ALLOW_STATIC_SELECTION", "true")
     monkeypatch.setattr(
         notion_admission,
