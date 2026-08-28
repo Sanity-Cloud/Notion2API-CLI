@@ -36,9 +36,19 @@ from app.aigentbee_workbench import (
     leader_session_name,
     load_swarm_widget_html,
     validate_leader_request,
+    validate_prerequisite_progression,
+)
+from app.mcp_observability import (
+    install_mcp_noise_filter,
+    mcp_observability_snapshot,
+    record_mcp_http_error,
 )
 from app.output_hygiene import detect_visible_output_contamination
 from app.output_integrity import assess_output_integrity
+from app.session_retention import (
+    archive_and_filter_sessions,
+    build_session_retention_plan,
+)
 from app.hive_runtime import (
     HiveDelegatedTaskSpec,
     HiveHandoffReceipt,
@@ -49,6 +59,7 @@ from app.hive_runtime import (
     default_hive_runtime_db_path,
     get_hive_runtime_store,
 )
+from app.hive_multithread import leader_conversation_id
 from app.hive_dispatcher import (
     HiveAdapterSnapshot,
     HiveExecutionSnapshot,
@@ -120,6 +131,7 @@ DEFAULT_CHAT_JOB_DB_PATH = Path(
     )
 )
 DEFAULT_CHAT_STALL_SECONDS = 180.0
+DEFAULT_CHAT_JOB_WATCHDOG_SECONDS = 5.0
 MAX_PROGRESS_REASONING_CHARS = 200_000
 MAX_CHAT_JOB_RESPONSE_PREVIEW_CHARS = 4_000
 MAX_CHAT_JOB_PROMPT_CHARS = 20_000
@@ -129,6 +141,7 @@ SESSION_STATE_VERSION = 2
 _SESSION_STATE_MUTEX = threading.RLock()
 _CHAT_JOB_STATE_MUTEX = threading.RLock()
 _CHAT_JOB_TASKS: dict[str, asyncio.Task[dict[str, Any]]] = {}
+_CHAT_JOB_WATCHDOG_TASK: asyncio.Task[None] | None = None
 _CHAT_JOB_STATE_CACHE: dict[
     str, tuple[tuple[int, int, int, int] | None, dict[str, Any]]
 ] = {}
@@ -136,7 +149,7 @@ _CHAT_JOB_DB_READY: set[str] = set()
 logger = logging.getLogger(__name__)
 CHAT_JOB_STATE_WRITE_RETRIES = 5
 CHAT_JOB_STATE_WRITE_BACKOFF_SECONDS = 0.05
-CHAT_JOB_LEDGER_SCHEMA_VERSION = 1
+CHAT_JOB_LEDGER_SCHEMA_VERSION = 2
 
 
 class HealthOutput(BaseModel):
@@ -153,22 +166,57 @@ class HealthOutput(BaseModel):
         default_factory=dict,
         description="Shared Notion admission queue, throttling, and idempotency receipt.",
     )
-    raw: dict[str, Any] = Field(default_factory=dict, description="Raw backend health response.")
+    conversation_compression: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Compression backend, warning-coalescing, and context telemetry.",
+    )
+    mcp_runtime: dict[str, Any] = Field(
+        default_factory=dict,
+        description="MCP transport correlation and routine-log coalescing telemetry.",
+    )
+    raw: dict[str, Any] = Field(default_factory=dict, description="Raw backend health response plus local MCP telemetry.")
 
 
 class ModelInfo(BaseModel):
-    id: str = Field(description="Model id.")
+    id: str = Field(description="Canonical Notion model route id.")
     object: str | None = Field(default=None, description="OpenAI-style object type, usually model.")
     created: int | None = Field(default=None, description="Creation timestamp, if supplied.")
     owned_by: str | None = Field(default=None, description="Provider or owner, if supplied.")
+    canonical_id: str = Field(default="")
+    public_name: str = Field(default="")
+    display_name: str = Field(default="")
+    model_family: str = Field(default="")
+    model_provider: str = Field(default="")
+    display_group: str = Field(default="")
+    model_card_attributes: dict[str, int] | None = Field(default=None)
+    supported_reasoning_efforts: list[str] = Field(default_factory=list)
+    default_reasoning_effort: str = Field(default="")
+    routes: dict[str, Any] = Field(default_factory=dict)
+    is_disabled: bool = Field(default=False)
+    disabled_reason: str = Field(default="")
+    is_approaching_rate_limit: bool = Field(default=False)
+    metadata_source: str = Field(default="")
 
 
 class ListModelsOutput(BaseModel):
     ok: bool = Field(description="Whether the models call succeeded.")
     status_code: int | None = Field(default=None, description="HTTP status code returned by Notion2API.")
     count: int = Field(default=0, description="Number of model entries returned.")
-    models: list[ModelInfo] = Field(default_factory=list, description="JSON-safe OpenAI-style model entries.")
+    models: list[ModelInfo] = Field(default_factory=list, description="Authoritative model, effort, rating, restriction, and route entries.")
+    catalog: dict[str, Any] = Field(default_factory=dict, description="Catalog source, freshness, hash, and fallback receipt.")
     error: str | None = Field(default=None, description="Error summary if the backend did not return models.")
+
+
+class ChatHistoryOutput(BaseModel):
+    ok: bool = Field(description="Whether the requested chat-history action succeeded.")
+    action: str = Field(description="Validated grouped chat-history action.")
+    status_code: int | None = Field(default=None, description="HTTP status code returned by Notion2API.")
+    result: dict[str, Any] = Field(default_factory=dict, description="Bounded action-specific result.")
+    pagination: dict[str, Any] = Field(default_factory=dict, description="Deterministic page receipt for list and search actions.")
+    provenance: dict[str, Any] = Field(default_factory=dict, description="Whitelisted account, workspace, teamspace, and governance provenance.")
+    partial: bool = Field(default=False, description="Whether the backend reported a partial rather than complete result.")
+    idempotent: bool = Field(default=True, description="Whether repeating the same action and inputs is designed to avoid duplicates.")
+    error: str | None = Field(default=None, description="Bounded error summary.")
 
 
 class ChatOutput(BaseModel):
@@ -177,6 +225,9 @@ class ChatOutput(BaseModel):
     model: str = Field(description="Requested model id passed through the MCP wrapper.")
     actual_model: str = Field(default="", description="Actual Notion model/provider route used, if returned.")
     model_metadata: dict[str, Any] | None = Field(default=None, description="Notion2API model metadata, if any.")
+    requested_reasoning_effort: str | None = Field(default=None, description="Exact reasoning effort requested by the caller.")
+    resolved_reasoning_effort: str | None = Field(default=None, description="Validated effort sent to Notion, including catalog defaults.")
+    reasoning_effort_source: str = Field(default="", description="explicit, catalog_default, or not_supported.")
     requested_model: str = Field(default="", description="Requested model alias originally passed to the MCP wrapper.")
     resolved_model: str = Field(default="", description="Concrete Notion route resolved from the requested alias.")
     verified_model: str = Field(default="", description="Responder model only when supported by authoritative upstream evidence.")
@@ -248,6 +299,9 @@ class ResponsesOutput(BaseModel):
     model: str = Field(description="Requested model id passed through the MCP wrapper.")
     actual_model: str = Field(default="", description="Observed Notion model/provider route, if returned.")
     model_metadata: dict[str, Any] | None = Field(default=None, description="Notion2API model metadata, if any.")
+    requested_reasoning_effort: str | None = Field(default=None, description="Exact reasoning effort requested by the caller.")
+    resolved_reasoning_effort: str | None = Field(default=None, description="Validated effort sent to Notion, including catalog defaults.")
+    reasoning_effort_source: str = Field(default="", description="explicit, catalog_default, or not_supported.")
     requested_model: str = Field(default="", description="Requested model alias originally passed to the MCP wrapper.")
     resolved_model: str = Field(default="", description="Concrete Notion route resolved from the requested alias.")
     verified_model: str = Field(default="", description="Responder model only when verified by upstream evidence.")
@@ -293,6 +347,24 @@ class ListSessionsOutput(BaseModel):
     default_session: str = Field(description="Default session policy. New chats are auto-named; explicit op remains a shared legacy alias.")
     state_path: str = Field(description="Path to the MCP session state file.")
     sessions: list[dict[str, Any]] = Field(default_factory=list, description="Known named MCP session bindings and remote thread metadata.")
+    retention: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Preview-only retention plan; no session is removed by listing.",
+    )
+
+
+class SessionRetentionOutput(BaseModel):
+    ok: bool = Field(description="Whether retention planning or application succeeded.")
+    applied: bool = Field(default=False, description="Whether eligible bindings were archived and removed from the active index.")
+    state_path: str = Field(default="", description="Active MCP session-state path.")
+    archive_path: str = Field(default="", description="Append-only JSONL archive receipt path.")
+    policy: dict[str, Any] = Field(default_factory=dict)
+    counts: dict[str, int] = Field(default_factory=dict)
+    protected: list[dict[str, Any]] = Field(default_factory=list)
+    candidates: list[dict[str, Any]] = Field(default_factory=list)
+    archived: int = Field(default=0)
+    retained: int = Field(default=0)
+    error: str | None = Field(default=None)
 
 
 class UnsafeUrlContinuationOutput(BaseModel):
@@ -396,11 +468,91 @@ class ChatJobOutput(BaseModel):
     stalled_for_seconds: float = Field(default=0.0, description="Seconds since meaningful public progress changed.")
     dead_loop_suspected: bool = Field(default=False, description="Whether the job appears stalled and may require cancellation.")
     cancel_recommended: bool = Field(default=False, description="Whether cancellation should be considered before further polling.")
+    retry_safe: bool = Field(
+        default=False,
+        description="Whether retrying this same request_id is safe without first reconciling an unknown upstream outcome.",
+    )
+    reconciliation_required: bool = Field(
+        default=False,
+        description="Whether the local tracker lacks a confirmed terminal upstream outcome and must be reconciled before replacement work.",
+    )
+    cancellation_state: str = Field(
+        default="",
+        description="Cancellation lifecycle state. Local cancellation is not treated as upstream cancellation acknowledgement.",
+    )
+    upstream_execution_state: str = Field(
+        default="",
+        description="Observed upstream execution state such as unknown, active, terminal, or not_started.",
+    )
+    cancel_requested_at: int = Field(default=0, description="Unix epoch milliseconds when cancellation was requested.")
+    cancelled_from_status: str = Field(default="", description="Job status immediately before local cancellation.")
+    stalled_for_seconds_at_cancel: float = Field(
+        default=0.0,
+        description="Immutable stall duration captured immediately before cancellation.",
+    )
+    dead_loop_suspected_at_cancel: bool = Field(
+        default=False,
+        description="Whether the stall detector was active immediately before cancellation.",
+    )
+    late_completion_detected: bool = Field(
+        default=False,
+        description="Whether a terminal local conversation checkpoint was observed after local cancellation.",
+    )
+    recommended_poll_delay_ms: int = Field(
+        default=0,
+        description="Adaptive delay clients should wait before the next get_chat_job poll.",
+    )
+    next_poll_after_ms: int = Field(
+        default=0,
+        description="Unix epoch milliseconds after which the next poll is advised.",
+    )
+    poll_hint: str = Field(
+        default="",
+        description="Human-readable next-poll guidance that preserves stall/cancel semantics.",
+    )
     response: dict[str, Any] | None = Field(default=None, description="Persisted ChatOutput-compatible response, if available.")
     error: str | None = Field(default=None, description="Persisted error summary, if any.")
     raw_job: dict[str, Any] = Field(default_factory=dict, description="Raw persisted job state.")
     last_response: dict[str, Any] | None = Field(default=None, description="Optional latest local assistant response lookup.")
 
+
+def _adaptive_poll_guidance(job: dict[str, Any]) -> dict[str, Any]:
+    """Recommend a poll delay that slows down as work continues and stalls."""
+
+    status = str(job.get("status") or "")
+    now = _now_ms()
+    if status in {"completed", "error", "cancelled", "stale", "indeterminate_output"}:
+        return {
+            "recommended_poll_delay_ms": 0,
+            "next_poll_after_ms": now,
+            "poll_hint": "Job is terminal; further polling is optional.",
+        }
+    poll_count = max(0, int(job.get("poll_count") or 0))
+    stalled = float(job.get("stalled_for_seconds") or 0.0)
+    dead_loop = bool(job.get("dead_loop_suspected"))
+    if dead_loop:
+        delay = 5_000
+        hint = (
+            "No meaningful public progress; cancel_recommended is set. "
+            "Wait before polling again or cancel explicitly."
+        )
+    elif stalled >= 30:
+        delay = 3_000
+        hint = "Progress appears slow; back off polling to avoid storms."
+    elif poll_count >= 20:
+        delay = 2_500
+        hint = "High poll count; use the recommended delay to avoid poll storms."
+    elif poll_count >= 8:
+        delay = 1_500
+        hint = "Continue polling with moderate backoff."
+    else:
+        delay = 750
+        hint = "Poll get_chat_job after the recommended delay."
+    return {
+        "recommended_poll_delay_ms": delay,
+        "next_poll_after_ms": now + delay,
+        "poll_hint": hint,
+    }
 
 
 def prepare_mcp_file_attachments(
@@ -694,6 +846,15 @@ MCPModel = Annotated[
         )
     ),
 ]
+MCPReasoningEffort = Annotated[
+    str | None,
+    Field(
+        description=(
+            "Exact model-specific Notion reasoning effort. Omit to use the live catalog default. "
+            "Unsupported values fail closed and are never silently downgraded."
+        )
+    ),
+]
 
 MCPSessionName = Annotated[
     str | None,
@@ -720,8 +881,8 @@ MCPNotionMode = Annotated[
     Field(description="Notion AI mode: default can search and edit; ask is read-only; research enables deeper research."),
 ]
 MCPNotionTask = Annotated[
-    Literal["visualize", "create_slides", "spreadsheet", "deep_research"] | None,
-    Field(description="Optional Notion AI task preset for visualizations, slide decks, spreadsheets, or deep research."),
+    Literal["visualize", "generate_image", "create_slides", "spreadsheet", "deep_research"] | None,
+    Field(description="Optional Notion AI task preset for data/HTML visualizations, image generation, slide decks, spreadsheets, or deep research."),
 ]
 MCPNotionSources = Annotated[
     list[str] | None,
@@ -754,21 +915,78 @@ class Notion2APIClient:
         self.api_key = (api_key or "").strip()
         self.timeout = timeout
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, request_id: str | None = None) -> dict[str, str]:
         headers = {"Accept": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if request_id:
+            headers["X-Request-ID"] = request_id
         return headers
 
-    async def get(self, path: str) -> dict[str, Any]:
+    async def get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        request_id = f"mcp-{uuid.uuid4().hex}"
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(f"{self.base_url}{path}", headers=self._headers())
-        return _json_or_error(response)
+            response = await client.get(
+                f"{self.base_url}{path}",
+                headers=self._headers(request_id),
+                params=params,
+            )
+        return _json_or_error(
+            response,
+            correlation_id=request_id,
+            method="GET",
+            path=path,
+        )
+
+    async def get_text(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        max_chars: int = 50_000,
+    ) -> dict[str, Any]:
+        request_id = f"mcp-{uuid.uuid4().hex}"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get(
+                f"{self.base_url}{path}",
+                headers=self._headers(request_id),
+                params=params,
+            )
+        if response.status_code >= 400:
+            return _json_or_error(
+                response,
+                correlation_id=request_id,
+                method="GET",
+                path=path,
+            )
+        text = response.text
+        bounded = text[:max_chars]
+        return {
+            "ok": True,
+            "status_code": response.status_code,
+            "text": bounded,
+            "text_chars": len(text),
+            "truncated": len(text) > len(bounded),
+        }
 
     async def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        request_id = f"mcp-{uuid.uuid4().hex}"
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(f"{self.base_url}{path}", headers=self._headers(), json=payload)
-        return _json_or_error(response)
+            response = await client.post(
+                f"{self.base_url}{path}",
+                headers=self._headers(request_id),
+                json=payload,
+            )
+        return _json_or_error(
+            response,
+            correlation_id=request_id,
+            method="POST",
+            path=path,
+        )
 
     async def post_chat_stream(self, path: str, payload: dict[str, Any], on_progress: Any) -> dict[str, Any]:
         stream_payload = dict(payload)
@@ -785,13 +1003,23 @@ class Notion2APIClient:
         done_received = False
         stream_error: dict[str, Any] | None = None
 
-        headers = self._headers()
+        request_id = f"mcp-{uuid.uuid4().hex}"
+        headers = self._headers(request_id)
         headers["Accept"] = "text/event-stream"
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             async with client.stream("POST", f"{self.base_url}{path}", headers=headers, json=stream_payload) as response:
                 if response.status_code >= 400:
                     body = await response.aread()
-                    return _json_or_error(httpx.Response(response.status_code, headers=response.headers, content=body))
+                    return _json_or_error(
+                        httpx.Response(
+                            response.status_code,
+                            headers=response.headers,
+                            content=body,
+                        ),
+                        correlation_id=request_id,
+                        method="POST",
+                        path=path,
+                    )
                 remote_conversation_id = str(response.headers.get("X-Conversation-Id") or "").strip()
                 remote_chat_id = str(response.headers.get("X-Notion-Thread-Id") or "").strip()
                 if remote_conversation_id:
@@ -968,7 +1196,13 @@ class Notion2APIClient:
 
 
 
-def _json_or_error(response: httpx.Response) -> dict[str, Any]:
+def _json_or_error(
+    response: httpx.Response,
+    *,
+    correlation_id: str = "",
+    method: str = "",
+    path: str = "",
+) -> dict[str, Any]:
     content_type = response.headers.get("content-type", "")
     try:
         data: Any = response.json() if "json" in content_type.lower() or response.content else {}
@@ -976,10 +1210,40 @@ def _json_or_error(response: httpx.Response) -> dict[str, Any]:
         data = {"text": response.text[:4000]}
 
     if response.status_code >= 400:
+        response_request_id = str(
+            response.headers.get("X-Request-ID")
+            or response.headers.get("X-Correlation-ID")
+            or response.headers.get("traceparent")
+            or ""
+        ).strip()
+        correlation = {
+            "request_id": str(correlation_id or response_request_id),
+            "response_request_id": response_request_id,
+            "method": str(method).upper(),
+            "path": str(path),
+        }
+        record_mcp_http_error(
+            status_code=response.status_code,
+            request_id=correlation["request_id"],
+            response_request_id=response_request_id,
+            method=correlation["method"],
+            path=correlation["path"],
+        )
+        logger.warning(
+            "MCP backend HTTP request failed",
+            extra={
+                "request_info": {
+                    "event": "mcp_backend_http_error",
+                    "status_code": response.status_code,
+                    **correlation,
+                }
+            },
+        )
         return {
             "ok": False,
             "status_code": response.status_code,
             "error": data,
+            "correlation": correlation,
         }
     if isinstance(data, dict):
         data.setdefault("ok", True)
@@ -1014,6 +1278,99 @@ def _int_or_none(value: Any) -> int | None:
     return None
 
 
+def _safe_chat_history_provenance(
+    account_data: dict[str, Any],
+    *,
+    requested_account_index: int,
+) -> dict[str, Any]:
+    if not isinstance(account_data, dict) or not account_data.get("ok"):
+        return {
+            "status": "unavailable",
+            "requested_account_index": requested_account_index,
+        }
+    requested_account: dict[str, Any] = {}
+    accounts = account_data.get("accounts")
+    if isinstance(accounts, list) and 0 <= requested_account_index < len(accounts):
+        candidate = accounts[requested_account_index]
+        if isinstance(candidate, dict):
+            requested_account = {
+                "account_number": candidate.get("account_number"),
+                "profile_name": candidate.get("profile_name"),
+                "base_profile_name": candidate.get("base_profile_name"),
+                "workspace_key": candidate.get("workspace_key"),
+                "workspace_name": candidate.get("workspace_name"),
+                "workspace_id": candidate.get("space_id"),
+                "teamspace_name": candidate.get("teamspace_name"),
+                "selected": candidate.get("selected"),
+                "available": candidate.get("available"),
+                "governance_aligned": candidate.get("governance_aligned"),
+            }
+            requested_account = {
+                key: value
+                for key, value in requested_account.items()
+                if value not in (None, "")
+            }
+    return {
+        "status": "available",
+        "requested_account_index": requested_account_index,
+        "requested_account": requested_account,
+        "selection_mode": account_data.get("mode"),
+        "workspace_key": account_data.get("workspace_key"),
+        "workspace_name": account_data.get("workspace_name"),
+        "workspace_id": account_data.get("workspace_id"),
+        "teamspace_name": account_data.get("teamspace_name"),
+        "teamspace_id": account_data.get("teamspace_id"),
+        "selected_account_number": account_data.get("selected_account_number"),
+        "selected_profile_name": account_data.get("selected_profile_name"),
+        "governance": dict(account_data.get("governance") or {}),
+    }
+
+
+def _chat_history_partial_result(data: dict[str, Any]) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if bool(data.get("partial")) or int(data.get("status_code") or 0) == 207:
+        return True
+    if (
+        str(data.get("stopped_reason") or "").strip().lower() == "max_pages"
+        and bool(data.get("next_cursor"))
+    ):
+        return True
+    thread = data.get("thread")
+    if isinstance(thread, dict) and thread.get("hydrated") is False:
+        return True
+    for key in ("failed", "failures", "errors", "remote_failed"):
+        value = data.get(key)
+        if isinstance(value, (list, dict)) and value:
+            return True
+        if isinstance(value, int) and value > 0:
+            return True
+    for key in ("sync_summary", "remote_result", "results"):
+        nested = data.get(key)
+        if isinstance(nested, dict) and _chat_history_partial_result(nested):
+            return True
+    return False
+
+
+def _bounded_chat_history_thread(
+    data: dict[str, Any],
+    *,
+    message_limit: int,
+) -> dict[str, Any]:
+    bounded = dict(data)
+    messages = data.get("messages")
+    if isinstance(messages, list):
+        bounded["messages"] = messages[:message_limit]
+        bounded["messages_returned"] = len(bounded["messages"])
+        bounded["messages_total"] = len(messages)
+        bounded["messages_truncated"] = len(messages) > message_limit
+    steps = data.get("process_steps")
+    if isinstance(steps, list):
+        bounded["process_steps"] = steps[:message_limit]
+        bounded["process_steps_truncated"] = len(steps) > message_limit
+    return bounded
+
+
 def _model_info_from_entry(entry: Any) -> ModelInfo | None:
     if not isinstance(entry, dict):
         return None
@@ -1025,6 +1382,28 @@ def _model_info_from_entry(entry: Any) -> ModelInfo | None:
         object=_string_or_none(entry.get("object")),
         created=_int_or_none(entry.get("created")),
         owned_by=_string_or_none(entry.get("owned_by")),
+        canonical_id=str(entry.get("canonical_id") or model_id),
+        public_name=str(entry.get("public_name") or ""),
+        display_name=str(entry.get("display_name") or ""),
+        model_family=str(entry.get("model_family") or ""),
+        model_provider=str(entry.get("model_provider") or ""),
+        display_group=str(entry.get("display_group") or ""),
+        model_card_attributes=(
+            dict(entry.get("model_card_attributes"))
+            if isinstance(entry.get("model_card_attributes"), dict)
+            else None
+        ),
+        supported_reasoning_efforts=[
+            str(value)
+            for value in (entry.get("supported_reasoning_efforts") or [])
+            if str(value)
+        ],
+        default_reasoning_effort=str(entry.get("default_reasoning_effort") or ""),
+        routes=dict(entry.get("routes") or {}) if isinstance(entry.get("routes"), dict) else {},
+        is_disabled=bool(entry.get("is_disabled", False)),
+        disabled_reason=str(entry.get("disabled_reason") or ""),
+        is_approaching_rate_limit=bool(entry.get("is_approaching_rate_limit", False)),
+        metadata_source=str(entry.get("metadata_source") or ""),
     )
 
 
@@ -1230,6 +1609,28 @@ def _extract_responses_text(data: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _reasoning_effort_trace(data: dict[str, Any]) -> dict[str, Any]:
+    metadata = data.get("model_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    selection = metadata.get("model_selection")
+    if not isinstance(selection, dict):
+        selection = {}
+    return {
+        "requested_reasoning_effort": metadata.get(
+            "requested_reasoning_effort", selection.get("requested_reasoning_effort")
+        ),
+        "resolved_reasoning_effort": metadata.get(
+            "resolved_reasoning_effort", selection.get("resolved_reasoning_effort")
+        ),
+        "reasoning_effort_source": str(
+            metadata.get("reasoning_effort_source")
+            or selection.get("reasoning_effort_source")
+            or ""
+        ),
+    }
+
+
 def _responses_output_from_backend(
     *,
     data: dict[str, Any],
@@ -1251,6 +1652,7 @@ def _responses_output_from_backend(
             if isinstance(data.get("model_metadata"), dict)
             else None
         ),
+        **_reasoning_effort_trace(data),
         **_model_identity_trace(data, model),
         **_governance_trace(data),
         **_caller_trace(
@@ -1387,6 +1789,16 @@ def _configured_chat_stall_seconds() -> float:
     raw = os.getenv("MCP_NOTION2API_STALL_SECONDS", "")
     configured = _safe_float(raw, DEFAULT_CHAT_STALL_SECONDS) if raw.strip() else DEFAULT_CHAT_STALL_SECONDS
     return max(15.0, configured)
+
+
+def _configured_chat_job_watchdog_seconds() -> float:
+    raw = os.getenv("MCP_NOTION2API_JOB_WATCHDOG_SECONDS", "")
+    configured = (
+        _safe_float(raw, DEFAULT_CHAT_JOB_WATCHDOG_SECONDS)
+        if raw.strip()
+        else DEFAULT_CHAT_JOB_WATCHDOG_SECONDS
+    )
+    return min(60.0, max(1.0, configured))
 
 
 def _bounded_chat_wait_seconds(wait_seconds: float | None) -> float:
@@ -1574,12 +1986,76 @@ def _ensure_chat_job_db_schema(conn: sqlite3.Connection) -> None:
             ON chat_jobs(conversation_id, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_chat_jobs_session_updated
             ON chat_jobs(session_name, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS chat_job_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL,
+            event_at INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            previous_status TEXT NOT NULL DEFAULT '',
+            new_status TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_job_events_request_time
+            ON chat_job_events(request_id, event_at, event_id);
         """
     )
     conn.execute(
         "INSERT OR REPLACE INTO ledger_metadata(key, value) VALUES ('schema_version', ?)",
         (str(CHAT_JOB_LEDGER_SCHEMA_VERSION),),
     )
+
+
+def _chat_job_event_metadata(job: dict[str, Any]) -> dict[str, Any]:
+    progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+    return {
+        "last_progress_at": int(job.get("last_progress_at") or 0),
+        "stalled_for_seconds": float(job.get("stalled_for_seconds") or 0.0),
+        "dead_loop_suspected": bool(job.get("dead_loop_suspected")),
+        "cancel_recommended": bool(job.get("cancel_recommended")),
+        "cancel_requested_at": int(job.get("cancel_requested_at") or 0),
+        "cancellation_state": str(job.get("cancellation_state") or ""),
+        "upstream_execution_state": str(job.get("upstream_execution_state") or ""),
+        "reconciliation_required": bool(job.get("reconciliation_required")),
+        "progress_phase": str(progress.get("phase") or ""),
+        "quarantined": bool(job.get("quarantined")),
+    }
+
+
+def _append_chat_job_transition_events(
+    conn: sqlite3.Connection,
+    state: dict[str, Any],
+    request_ids: set[str] | None,
+) -> None:
+    jobs = state.get("jobs") if isinstance(state.get("jobs"), dict) else {}
+    ids = request_ids if request_ids is not None else {str(key) for key in jobs}
+    for request_id in ids:
+        job = jobs.get(request_id)
+        if not isinstance(job, dict):
+            continue
+        row = conn.execute(
+            "SELECT status FROM chat_jobs WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        previous_status = str(row["status"] if row is not None else "")
+        new_status = str(job.get("status") or "")
+        if previous_status == new_status:
+            continue
+        event_type = "job_created" if not previous_status else "status_transition"
+        conn.execute(
+            """
+            INSERT INTO chat_job_events(
+                request_id, event_at, event_type, previous_status, new_status, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request_id,
+                int(job.get("updated_at") or _now_ms()),
+                event_type,
+                previous_status,
+                new_status,
+                json.dumps(_chat_job_event_metadata(job), ensure_ascii=False, sort_keys=True),
+            ),
+        )
 
 
 def _encoded_chat_job(job: dict[str, Any]) -> tuple[bytes, str, int]:
@@ -1816,6 +2292,7 @@ def _save_chat_job_state(
             _ensure_chat_job_db(path, storage_path)
             with _chat_job_db(storage_path) as conn:
                 conn.execute("PRAGMA synchronous = FULL")
+                _append_chat_job_transition_events(conn, state, changed_request_ids)
                 _upsert_chat_jobs(conn, state, changed_request_ids)
                 conn.commit()
         else:
@@ -2003,6 +2480,7 @@ def _refresh_chat_job_health(job: dict[str, Any], *, increment_poll: bool = Fals
     now = _now_ms()
     if increment_poll:
         updated["poll_count"] = int(updated.get("poll_count") or 0) + 1
+        updated["last_polled_at"] = now
     active = str(updated.get("status") or "") in {"running", "pending"}
     last_progress_at = int(
         updated.get("last_progress_at")
@@ -2024,7 +2502,34 @@ def _refresh_chat_job_health(job: dict[str, Any], *, increment_poll: bool = Fals
             "cancel_recommended": dead_loop_suspected,
         }
         updated["progress"] = progress
+    guidance = _adaptive_poll_guidance(updated)
+    updated.update(guidance)
     return updated
+
+
+def _refresh_and_persist_chat_job_health(
+    request_id: str,
+    *,
+    increment_poll: bool = False,
+) -> dict[str, Any] | None:
+    """Refresh monitoring fields against the latest persisted state.
+
+    Polling previously refreshed only a process-local copy. Persisting from a
+    stale caller copy could also overwrite a concurrently terminalized job, so
+    this helper always reloads the latest record while holding the job mutex.
+    """
+
+    normalized_id = _normalize_request_id(request_id)
+    with _CHAT_JOB_STATE_MUTEX:
+        state = _load_chat_job_state()
+        jobs = state.setdefault("jobs", {})
+        current = jobs.get(normalized_id)
+        if not isinstance(current, dict):
+            return None
+        updated = _refresh_chat_job_health(current, increment_poll=increment_poll)
+        jobs[normalized_id] = updated
+        _save_chat_job_state(state, changed_request_ids={normalized_id})
+        return updated
 
 
 def _persist_chat_progress(request_id: str, reasoning: str, content: str, event_count: int, complete: bool) -> None:
@@ -2038,15 +2543,22 @@ def _persist_chat_progress(request_id: str, reasoning: str, content: str, event_
         job = dict(current)
         snapshot = _progress_snapshot(reasoning, content, event_count, complete)
         fingerprint = _progress_fingerprint(snapshot)
-        if fingerprint != str(job.get("progress_fingerprint") or "") or complete:
+        previous_fingerprint = str(job.get("progress_fingerprint") or "")
+        if fingerprint == previous_fingerprint and not complete:
+            # Suppress redundant durable writes when public progress is unchanged.
+            return
+        if fingerprint != previous_fingerprint or complete:
             job["last_progress_at"] = now
         job["progress_fingerprint"] = fingerprint
         job["progress"] = snapshot
         job["updated_at"] = now
         job = _refresh_chat_job_health(job)
         jobs[request_id] = job
-        # ponytail: progress stays process-local until terminal persistence;
-        # add a small append-only journal if sub-second crash recovery matters.
+        last_persisted_at = int(job.get("progress_persisted_at") or 0)
+        if complete or now - last_persisted_at >= 5_000:
+            job["progress_persisted_at"] = now
+            jobs[request_id] = job
+            _save_chat_job_state(state, changed_request_ids={request_id})
 
 
 def _load_chat_job(request_id: str) -> dict[str, Any] | None:
@@ -2061,6 +2573,9 @@ def _mark_chat_job_stale(job: dict[str, Any]) -> dict[str, Any]:
     updated["status"] = "stale"
     updated["updated_at"] = _now_ms()
     updated["error"] = "The MCP wrapper restarted or lost the in-memory task before this job completed. Check the local conversation by conversation_id before retrying."
+    updated["retry_safe"] = False
+    updated["reconciliation_required"] = True
+    updated["upstream_execution_state"] = "unknown"
     updated = _refresh_chat_job_health(updated)
     _persist_chat_job(updated)
     return updated
@@ -2069,6 +2584,28 @@ def _mark_chat_job_stale(job: dict[str, Any]) -> dict[str, Any]:
 def _cancel_chat_job(request_id: str, reason: str = "Cancelled by caller.") -> ChatJobOutput:
     normalized_id = _normalize_request_id(request_id)
     task = _CHAT_JOB_TASKS.get(normalized_id)
+
+    # Reconcile a result that already reached the local conversation store
+    # before recording cancellation. This closes the race observed in live
+    # AIgentBee jobs where the backend had completed successfully but the MCP
+    # tracker was still marked active.
+    if task is not None and task.done():
+        _finalize_chat_job(normalized_id, task)
+        task = _CHAT_JOB_TASKS.get(normalized_id)
+    current = _load_chat_job(normalized_id)
+    if isinstance(current, dict):
+        current_status = str(current.get("status") or "")
+        if current_status in {"completed", "indeterminate_output", "error", "cancelled"}:
+            return _chat_job_output(normalized_id, increment_poll=False)
+        if current_status in {"running", "pending"} and "baseline_message_id" in current:
+            turn = _completed_turn_after_checkpoint(
+                str(current.get("conversation_id") or ""),
+                int(current.get("baseline_message_id") or 0),
+            )
+            if turn is not None:
+                _complete_chat_job_from_local_turn(normalized_id, current, turn)
+                return _chat_job_output(normalized_id, increment_poll=False)
+
     with _CHAT_JOB_STATE_MUTEX:
         state = _load_chat_job_state()
         jobs = state.setdefault("jobs", {})
@@ -2084,16 +2621,42 @@ def _cancel_chat_job(request_id: str, reason: str = "Cancelled by caller.") -> C
             "request_id": normalized_id,
             "job_id": normalized_id,
         }
+        pre_cancel = _refresh_chat_job_health(job)
+        previous_status = str(pre_cancel.get("status") or "")
+        now = _now_ms()
         job["status"] = "cancelled"
-        job["updated_at"] = _now_ms()
+        job["updated_at"] = now
         job["error"] = str(reason or "Cancelled by caller.")[:1000]
         job["dead_loop_suspected"] = False
         job["cancel_recommended"] = False
+        job["cancel_requested_at"] = now
+        job["cancelled_from_status"] = previous_status
+        job["stalled_for_seconds_at_cancel"] = float(
+            pre_cancel.get("stalled_for_seconds") or 0.0
+        )
+        job["dead_loop_suspected_at_cancel"] = bool(
+            pre_cancel.get("dead_loop_suspected")
+        )
+        job["cancel_recommended_at_cancel"] = bool(
+            pre_cancel.get("cancel_recommended")
+        )
+        job["last_progress_at_at_cancel"] = int(
+            pre_cancel.get("last_progress_at") or 0
+        )
+        job["retry_safe"] = False
+        job["reconciliation_required"] = True
+        job["upstream_execution_state"] = "unknown"
+        job["cancellation_state"] = (
+            "local_task_cancel_requested_upstream_unconfirmed"
+            if task is not None and not task.done()
+            else "local_tracker_cancelled_upstream_unconfirmed"
+        )
         jobs[normalized_id] = job
         _save_chat_job_state(state, changed_request_ids={normalized_id})
     if task is not None and not task.done():
         task.cancel()
-    _CHAT_JOB_TASKS.pop(normalized_id, None)
+    elif task is None:
+        _CHAT_JOB_TASKS.pop(normalized_id, None)
     return _chat_job_output(normalized_id, increment_poll=False)
 
 
@@ -2129,6 +2692,7 @@ def _chat_output_from_backend(
             if isinstance(data.get("model_metadata"), dict)
             else None
         ),
+        **_reasoning_effort_trace(data),
         **_model_identity_trace(data, model),
         **_governance_trace(data),
         **_caller_trace(
@@ -2182,6 +2746,10 @@ def _chat_pending_output(
     wait_seconds: float,
 ) -> dict[str, Any]:
     job = _refresh_chat_job_health(job)
+    status = str(job.get("status") or "pending")
+    reconciliation_required = bool(
+        job.get("reconciliation_required") or status in {"stale", "cancelled"}
+    )
     remote_chat_id = str(job.get("remote_chat_id") or job.get("notion_thread_id") or "")
     return {
         "ok": False,
@@ -2205,18 +2773,29 @@ def _chat_pending_output(
         "session_name": session_key,
         "conversation_id": conversation_id,
         "session_created": session_created,
-        "status": str(job.get("status") or "pending"),
+        "status": status,
         "request_id": request_id,
         "job_id": request_id,
-        "retry_safe": str(job.get("status") or "") in {"running", "pending", "stale"},
+        "retry_safe": status in {"running", "pending"} and not reconciliation_required,
+        "reconciliation_required": reconciliation_required,
+        "cancellation_state": str(job.get("cancellation_state") or ""),
+        "upstream_execution_state": str(job.get("upstream_execution_state") or ""),
         "wait_seconds": wait_seconds,
         "poll_hint": (
             f"Call get_chat_job(request_id='{request_id}') or retry the same chat tool with the same request_id."
-            if str(job.get("status") or "") in {"running", "pending", "stale"}
-            else "This request id is terminal; use a new request_id for new work."
+            if status in {"running", "pending"}
+            else (
+                "Reconcile this request_id before starting replacement work; the upstream outcome is not confirmed."
+                if reconciliation_required
+                else "This request id is terminal; use a new request_id for new work."
+            )
         ),
         "error": job.get("error") if isinstance(job.get("error"), str) else None,
-        "response_text": _job_response_text(job.get("response") if isinstance(job.get("response"), dict) else None),
+        "response_text": (
+            _job_response_text(job.get("response") if isinstance(job.get("response"), dict) else None)
+            if status == "completed"
+            else ""
+        ),
         **_attachment_provenance_from_job(job),
         "progress": job.get("progress") if isinstance(job.get("progress"), dict) else None,
         "remote_chat_id": remote_chat_id,
@@ -2475,6 +3054,9 @@ def _complete_chat_job_from_local_turn(
     completed["assistant_message_id"] = int(turn.get("assistant_message_id") or 0)
     completed["dead_loop_suspected"] = False
     completed["cancel_recommended"] = False
+    completed["retry_safe"] = False
+    completed["reconciliation_required"] = False
+    completed["upstream_execution_state"] = "terminal"
     if response.get("error"):
         completed["error"] = str(response["error"])
     _persist_chat_job(completed)
@@ -2489,6 +3071,41 @@ def _complete_chat_job_from_local_turn(
     if task is not None and not task.done():
         task.cancel()
     return completed["response"]
+
+
+def _reconcile_cancelled_chat_job_from_local_turn(
+    request_id: str,
+    job: dict[str, Any],
+    turn: dict[str, Any],
+) -> dict[str, Any]:
+    """Record a late upstream terminal observation without reviving cancellation.
+
+    A local cancellation is a tracker decision, not proof that Notion stopped.
+    If the conversation DB later contains the assistant turn, retain the
+    cancellation as terminal while closing the reconciliation gap explicitly.
+    """
+
+    response = _chat_output_from_local_turn(job, turn)
+    updated = dict(job)
+    updated["updated_at"] = _now_ms()
+    updated["late_completion_detected"] = True
+    updated["late_completion_at"] = updated["updated_at"]
+    updated["late_completion_status"] = str(response.get("status") or "")
+    updated["late_response_chars"] = len(str(response.get("response_text") or ""))
+    updated["late_output_integrity"] = response.get("output_integrity")
+    updated["late_quarantined"] = bool(response.get("quarantined"))
+    updated["upstream_execution_state"] = "terminal"
+    updated["reconciliation_required"] = False
+    updated["retry_safe"] = False
+    updated["cancellation_state"] = "local_cancelled_upstream_terminal_observed"
+    remote_chat_id = str(response.get("remote_chat_id") or "")
+    if remote_chat_id:
+        updated["remote_chat_id"] = remote_chat_id
+        updated["notion_thread_id"] = remote_chat_id
+    updated["assistant_message_id"] = int(turn.get("assistant_message_id") or 0)
+    _persist_chat_job(updated)
+    return updated
+
 
 def _active_job_for_conversation(
     conversation_id: str, *, exclude_request_id: str = ""
@@ -2551,6 +3168,18 @@ def _claim_chat_job_task(
                 continue
             if str(raw_job.get("conversation_id") or "") != conversation_id:
                 continue
+
+            # A locally cancelled/stale request can still be executing upstream.
+            # Until its outcome is reconciled, it remains a mutation fence for
+            # this conversation even though its local status is terminal.
+            if bool(raw_job.get("reconciliation_required")):
+                other_id = str(other_request_id)
+                return (
+                    "stale_conflict",
+                    dict(raw_job),
+                    _CHAT_JOB_TASKS.get(other_id),
+                    other_id,
+                )
             if str(raw_job.get("status") or "") not in {"running", "pending"}:
                 continue
 
@@ -2726,6 +3355,66 @@ async def _run_chat_completion_job(
     finally:
         if not stream_task.done():
             stream_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stream_task
+
+
+async def _chat_job_watchdog_loop() -> None:
+    """Reconcile and persist job health even when no client is polling.
+
+    This is intentionally a monitor, not an auto-canceller. A stalled request
+    can have an indeterminate upstream side effect, so replacement work remains
+    blocked until an operator/caller explicitly reconciles or cancels it.
+    """
+
+    while True:
+        await asyncio.sleep(_configured_chat_job_watchdog_seconds())
+        try:
+            state = _load_chat_job_state()
+            jobs = state.get("jobs", {}) if isinstance(state, dict) else {}
+            request_ids = [
+                str(request_id)
+                for request_id, raw_job in list(jobs.items())
+                if isinstance(raw_job, dict)
+                and (
+                    str(raw_job.get("status") or "") in {"running", "pending"}
+                    or (
+                        str(raw_job.get("status") or "") == "cancelled"
+                        and not bool(raw_job.get("late_completion_detected"))
+                    )
+                )
+            ]
+            for request_id in request_ids:
+                try:
+                    _chat_job_output(request_id, increment_poll=False)
+                except Exception:
+                    logger.exception(
+                        "Chat job watchdog reconciliation failed",
+                        extra={
+                            "request_info": {
+                                "event": "chat_job_watchdog_reconciliation_failed",
+                                "request_id": request_id,
+                            }
+                        },
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Chat job watchdog iteration failed",
+                extra={"request_info": {"event": "chat_job_watchdog_iteration_failed"}},
+            )
+
+
+def _ensure_chat_job_watchdog() -> asyncio.Task[None]:
+    global _CHAT_JOB_WATCHDOG_TASK
+    task = _CHAT_JOB_WATCHDOG_TASK
+    if task is None or task.done():
+        _CHAT_JOB_WATCHDOG_TASK = asyncio.create_task(
+            _chat_job_watchdog_loop(),
+            name="notion2api-chat-job-watchdog",
+        )
+    return _CHAT_JOB_WATCHDOG_TASK
 
 
 def _finalize_chat_job(request_id: str, task: asyncio.Task[dict[str, Any]]) -> None:
@@ -2784,6 +3473,10 @@ def _finalize_chat_job(request_id: str, task: asyncio.Task[dict[str, Any]]) -> N
 
         job["status"] = status
         job["updated_at"] = _now_ms()
+        if status in {"completed", "indeterminate_output", "error"}:
+            job["retry_safe"] = False
+            job["reconciliation_required"] = False
+            job["upstream_execution_state"] = "terminal"
         if response is not None:
             provenance = _attachment_provenance_from_job(job)
             response = {**response, **provenance}
@@ -2910,6 +3603,7 @@ async def _submit_or_resume_chat_job(
     request_id: str | None,
     wait_seconds: float | None,
 ) -> dict[str, Any]:
+    _ensure_chat_job_watchdog()
     normalized_id = _normalize_request_id(request_id)
     bounded_wait = _bounded_chat_wait_seconds(wait_seconds)
     metadata = payload.setdefault("metadata", {})
@@ -2955,7 +3649,7 @@ async def _submit_or_resume_chat_job(
         status = str(existing.get("status") or "")
         response = existing.get("response") if isinstance(existing.get("response"), dict) else None
         if status in {"completed", "indeterminate_output", "error", "cancelled"}:
-            if response:
+            if response and status != "cancelled":
                 return response
             if status == "completed" and "baseline_message_id" in existing:
                 turn = await asyncio.to_thread(
@@ -3065,6 +3759,9 @@ async def _submit_or_resume_chat_job(
             "updated_at": now,
             "last_progress_at": now,
             "poll_count": 0,
+            "retry_safe": True,
+            "reconciliation_required": False,
+            "upstream_execution_state": "active",
             "wait_seconds": bounded_wait,
             "baseline_message_id": baseline_message_id,
             **_runtime_audit(client, model),
@@ -3258,12 +3955,33 @@ def _chat_job_output(
                 job = _load_chat_job(normalized_id) or job
 
     if (
+        str(job.get("status") or "") == "cancelled"
+        and "baseline_message_id" in job
+        and not bool(job.get("late_completion_detected"))
+    ):
+        turn = _completed_turn_after_checkpoint(
+            str(job.get("conversation_id") or ""),
+            int(job.get("baseline_message_id") or 0),
+        )
+        if turn is not None:
+            job = _reconcile_cancelled_chat_job_from_local_turn(
+                normalized_id,
+                job,
+                turn,
+            )
+
+    if (
         str(job.get("status") or "") in {"running", "pending"}
         and normalized_id not in _CHAT_JOB_TASKS
     ):
         job = _mark_chat_job_stale(job)
 
-    job = _refresh_chat_job_health(job, increment_poll=increment_poll)
+    persisted_health = _refresh_and_persist_chat_job_health(
+        normalized_id,
+        increment_poll=increment_poll,
+    )
+    if persisted_health is not None:
+        job = persisted_health
     response = job.get("response") if isinstance(job.get("response"), dict) else None
     integrity = (
         dict(job["output_integrity"])
@@ -3381,10 +4099,24 @@ def _chat_job_output(
     if not route_disposition:
         route_disposition = "direct_route"
 
+    status = str(job.get("status") or "")
+    reconciliation_required = bool(
+        job.get("reconciliation_required")
+        or status == "stale"
+        or (
+            status == "cancelled"
+            and not bool(job.get("late_completion_detected"))
+        )
+    )
+    retry_safe = bool(job.get("retry_safe")) if "retry_safe" in job else status in {
+        "running",
+        "pending",
+    }
+
     return ChatJobOutput(
         ok=True,
         found=True,
-        status=str(job.get("status") or ""),
+        status=status,
         request_id=normalized_id,
         job_id=str(job.get("job_id") or normalized_id),
         session_name=str(job.get("session_name") or ""),
@@ -3406,7 +4138,7 @@ def _chat_job_output(
         ),
         output_integrity=integrity,
         quarantined=quarantined,
-        authoritative=not quarantined,
+        authoritative=(status == "completed" and not quarantined),
         quarantined_response_available=quarantined_available,
         quarantined_response_text=quarantined_response_text,
         **_attachment_provenance_from_job(job),
@@ -3417,6 +4149,22 @@ def _chat_job_output(
         stalled_for_seconds=float(job.get("stalled_for_seconds") or 0.0),
         dead_loop_suspected=bool(job.get("dead_loop_suspected")),
         cancel_recommended=bool(job.get("cancel_recommended")),
+        retry_safe=retry_safe and not reconciliation_required,
+        reconciliation_required=reconciliation_required,
+        cancellation_state=str(job.get("cancellation_state") or ""),
+        upstream_execution_state=str(job.get("upstream_execution_state") or ""),
+        cancel_requested_at=int(job.get("cancel_requested_at") or 0),
+        cancelled_from_status=str(job.get("cancelled_from_status") or ""),
+        stalled_for_seconds_at_cancel=float(
+            job.get("stalled_for_seconds_at_cancel") or 0.0
+        ),
+        dead_loop_suspected_at_cancel=bool(
+            job.get("dead_loop_suspected_at_cancel")
+        ),
+        late_completion_detected=bool(job.get("late_completion_detected")),
+        recommended_poll_delay_ms=int(job.get("recommended_poll_delay_ms") or 0),
+        next_poll_after_ms=int(job.get("next_poll_after_ms") or 0),
+        poll_hint=str(job.get("poll_hint") or ""),
         response=projected_response,
         error=job.get("error") if isinstance(job.get("error"), str) else None,
         raw_job=raw_job,
@@ -3488,7 +4236,9 @@ def _load_session_records(path: Path = DEFAULT_SESSION_STATE_PATH) -> dict[str, 
 def _save_session_records(
     records: dict[str, dict[str, Any]],
     path: Path = DEFAULT_SESSION_STATE_PATH,
-) -> None:
+    *,
+    strict: bool = False,
+) -> bool:
     with _SESSION_STATE_MUTEX:
         clean: dict[str, dict[str, Any]] = {}
         for raw_name, raw_record in records.items():
@@ -3509,9 +4259,12 @@ def _save_session_records(
                 path,
                 {"version": SESSION_STATE_VERSION, "sessions": clean},
             )
+            return True
         except Exception:
+            if strict:
+                raise
             # Session continuity is helpful but should not break model calls.
-            return
+            return False
 
 
 def _load_session_state(path: Path = DEFAULT_SESSION_STATE_PATH) -> dict[str, str]:
@@ -3520,6 +4273,47 @@ def _load_session_state(path: Path = DEFAULT_SESSION_STATE_PATH) -> dict[str, st
         for name, record in _load_session_records(path).items()
         if str(record.get("conversation_id") or "").strip()
     }
+
+
+def _session_archive_path(path: Path = DEFAULT_SESSION_STATE_PATH) -> Path:
+    return path.with_name(f"{path.stem}.archive.jsonl")
+
+
+def _session_job_bindings() -> tuple[set[str], set[str]]:
+    protected_names: set[str] = set()
+    protected_conversations: set[str] = set()
+    state = _load_chat_job_state()
+    jobs = state.get("jobs", {}) if isinstance(state, dict) else {}
+    if not isinstance(jobs, dict):
+        return protected_names, protected_conversations
+    for raw_job in jobs.values():
+        if not isinstance(raw_job, dict):
+            continue
+        session_name = str(raw_job.get("session_name") or "").strip()
+        conversation_id = str(raw_job.get("conversation_id") or "").strip()
+        if session_name:
+            protected_names.add(_session_key(session_name))
+        if conversation_id:
+            protected_conversations.add(conversation_id)
+    return protected_names, protected_conversations
+
+
+def _build_session_retention_plan(
+    records: dict[str, dict[str, Any]],
+    *,
+    retention_days: int | None = None,
+    max_records: int | None = None,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    protected_names, protected_conversations = _session_job_bindings()
+    return build_session_retention_plan(
+        records,
+        protected_session_names=protected_names,
+        protected_conversation_ids=protected_conversations,
+        retention_days=retention_days,
+        max_records=max_records,
+        now_ms=now_ms,
+    )
 
 
 def _save_session_state(sessions: dict[str, str], path: Path = DEFAULT_SESSION_STATE_PATH) -> None:
@@ -3922,6 +4716,7 @@ def create_server(
     mcp_path: str,
     stateless_http: bool = True,
 ) -> FastMCP:
+    install_mcp_noise_filter()
     client = Notion2APIClient(base_url=base_url, api_key=api_key, timeout=timeout)
     transport_security = _transport_security_settings(host=host)
     server_name = os.getenv("MCP_SERVER_NAME", "notion2api").strip() or "notion2api"
@@ -4145,6 +4940,11 @@ def create_server(
                     request_type,
                     requested_by,
                 )
+                validate_prerequisite_progression(
+                    snapshot,
+                    clean_request,
+                    clean_type,
+                )
                 member_name = member.title
                 member_role = member.role
                 lane_title = member.title
@@ -4240,7 +5040,8 @@ def create_server(
                 deduplicated = bool(existing_job)
 
                 conversation_id, session_key, session_created = _conversation_id_for_session(
-                    session_name
+                    session_name,
+                    conversation_id=leader_conversation_id(mission_id),
                 )
                 payload = {
                     "model": DEFAULT_MODEL,
@@ -4388,6 +5189,9 @@ def create_server(
     @server.tool(name=_tool_name("notion2api_health"), description=_tool_description("Check whether the configured Notion2API backend is reachable and healthy."), structured_output=True)
     async def notion2api_health() -> HealthOutput:
         data = await client.get("/health")
+        mcp_runtime = mcp_observability_snapshot()
+        raw = dict(data)
+        raw["mcp_runtime"] = mcp_runtime
         return HealthOutput(
             ok=bool(data.get("ok", False)),
             status_code=data.get("status_code"),
@@ -4399,7 +5203,11 @@ def create_server(
             account_selection=dict(data.get("account_selection") or {}),
             governance=dict(data.get("governance") or {}),
             notion_admission=dict(data.get("notion_admission") or {}),
-            raw=data,
+            conversation_compression=dict(
+                data.get("conversation_compression") or {}
+            ),
+            mcp_runtime=mcp_runtime,
+            raw=raw,
         )
 
     @server.tool(
@@ -4430,7 +5238,11 @@ def create_server(
     @server.tool(
         name=_tool_name("notion2api_switch_account"),
         description=_tool_description(
-            "Switch Notion2API to a named account profile. Use mode='pinned' with a profile name, email, user id, or account number; use mode='auto' to restore rotation and failover. Start a new remote chat after changing accounts because existing thread bindings are not migrated."
+            "Switch Notion2API to a named account profile or capacity alias "
+            "(Alpha/Beta/Canary/Dev). Use mode='pinned' with a profile name, alias, "
+            "email, user id, or account number; use mode='auto' for health-aware "
+            "rotation among production peers. Start a new remote chat after changing "
+            "accounts because existing thread bindings are not migrated."
         ),
         structured_output=True,
     )
@@ -4453,6 +5265,107 @@ def create_server(
     async def notion2api_rollback_account_switch() -> dict[str, Any]:
         return await client.post("/v1/notion/accounts/rollback", {})
 
+    @server.tool(
+        name=_tool_name("notion2api_list_cursor_agents"),
+        description=_tool_description(
+            "List Cursor custom-agent registry entries scoped by Notion account_key and workspace_id. Returns metadata and Bitwarden secret references only; never secret values."
+        ),
+        structured_output=True,
+    )
+    async def notion2api_list_cursor_agents(
+        account_key: str = "",
+        workspace_id: str = "",
+    ) -> dict[str, Any]:
+        from app.cursor_agent_registry import get_cursor_agent_registry
+
+        agents = get_cursor_agent_registry().list_agents(
+            account_key=account_key,
+            workspace_id=workspace_id,
+        )
+        return {
+            "ok": True,
+            "count": len(agents),
+            "agents": agents,
+        }
+
+    @server.tool(
+        name=_tool_name("notion2api_select_cursor_agent"),
+        description=_tool_description(
+            "Select a Cursor agent for an account/workspace pairing. Order: explicit agent -> account/workspace match -> repo-compatible healthy agent -> setup_required. Never crosses account/workspace boundaries."
+        ),
+        structured_output=True,
+    )
+    async def notion2api_select_cursor_agent(
+        cursor_agent_key: str = "",
+        account_key: str = "",
+        workspace_id: str = "",
+        repository_url: str = "",
+    ) -> dict[str, Any]:
+        from app.cursor_agent_registry import get_cursor_agent_registry
+
+        decision = get_cursor_agent_registry().select_agent(
+            cursor_agent_key=cursor_agent_key,
+            account_key=account_key,
+            workspace_id=workspace_id,
+            repository_url=repository_url,
+        )
+        return {"ok": True, **decision}
+
+    @server.tool(
+        name=_tool_name("notion2api_upsert_cursor_agent"),
+        description=_tool_description(
+            "Create or update a Cursor agent registry entry for one account/workspace pairing. Provide Bitwarden cursor_api_key_secret_id only; never pass raw API keys."
+        ),
+        structured_output=True,
+    )
+    async def notion2api_upsert_cursor_agent(
+        account_key: str,
+        workspace_id: str,
+        cursor_agent_key: str = "",
+        workspace_key: str = "",
+        base_profile_name: str = "",
+        workflow_id: str = "",
+        connection_id: str = "",
+        friendly_name: str = "",
+        role: str = "",
+        allowed_github_repos: list[str] | None = None,
+        enabled: bool = True,
+        is_default: bool = False,
+        health_state: str = "unknown",
+        setup_status: str = "unknown",
+        cursor_api_key_secret_id: str = "",
+        bitwarden_project_id: str = "",
+    ) -> dict[str, Any]:
+        from app.cursor_agent_registry import get_cursor_agent_registry
+
+        if any(
+            token in str(cursor_api_key_secret_id).casefold()
+            for token in ("key_", "sk-", "bearer ")
+        ):
+            return {
+                "ok": False,
+                "error": "Raw Cursor API keys are rejected; provide a Bitwarden secret id only.",
+            }
+        agent = get_cursor_agent_registry().upsert_agent(
+            account_key=account_key,
+            workspace_id=workspace_id,
+            cursor_agent_key=cursor_agent_key or None,
+            workspace_key=workspace_key,
+            base_profile_name=base_profile_name,
+            workflow_id=workflow_id,
+            connection_id=connection_id,
+            friendly_name=friendly_name,
+            role=role,
+            allowed_github_repos=allowed_github_repos,
+            enabled=enabled,
+            is_default=is_default,
+            health_state=health_state,
+            setup_status=setup_status,
+            cursor_api_key_secret_id=cursor_api_key_secret_id,
+            bitwarden_project_id=bitwarden_project_id,
+        )
+        return {"ok": True, "agent": agent}
+
     @server.tool(name=_tool_name("notion2api_list_models"), description=_tool_description("List Notion2API models from the configured backend."), structured_output=True)
     async def notion2api_list_models() -> ListModelsOutput:
         data = await client.get("/v1/models")
@@ -4468,13 +5381,181 @@ def create_server(
             status_code=data.get("status_code"),
             count=len(model_list),
             models=model_list,
+            catalog=dict(data.get("catalog") or {}) if isinstance(data.get("catalog"), dict) else {},
             error=_error_summary(data),
         )
 
-    @server.tool(name=_tool_name("notion2api_chat"), description=_tool_description("Submit a prompt to Notion2API using a durable session and return immediately with a pollable request_id. Terra is the default; omit model unless the user explicitly requests another. Omit session_name to generate one. Continue by session_name, conversation_id, or continue_from_request_id."), structured_output=True)
+    @server.tool(
+        name=_tool_name("notion2api_chat_history"),
+        description=_tool_description(
+            "Use one typed, bounded Notion2API chat-history action: status, list_threads, get_thread, "
+            "search, export_markdown, model_stats, sync_from_notion, or hydrate_thread. Destructive delete, "
+            "cleanup, raw-debug export, and local database mutation are intentionally excluded."
+        ),
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        structured_output=True,
+    )
+    async def notion2api_chat_history(
+        action: Literal[
+            "status",
+            "list_threads",
+            "get_thread",
+            "search",
+            "export_markdown",
+            "model_stats",
+            "sync_from_notion",
+            "hydrate_thread",
+        ],
+        thread_id: str | None = None,
+        query: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        message_limit: int = 100,
+        content_limit: int = 50_000,
+        account_index: int = 0,
+        max_pages: int = 5,
+        hydrate: bool = False,
+    ) -> ChatHistoryOutput:
+        normalized_action = str(action or "").strip()
+
+        def invalid(message: str) -> ChatHistoryOutput:
+            return ChatHistoryOutput(
+                ok=False,
+                action=normalized_action,
+                status_code=422,
+                error=message,
+            )
+
+        if account_index < 0:
+            return invalid("account_index must be zero or greater")
+        if offset < 0:
+            return invalid("offset must be zero or greater")
+        if message_limit < 1 or message_limit > 200:
+            return invalid("message_limit must be between 1 and 200")
+        if content_limit < 1 or content_limit > 200_000:
+            return invalid("content_limit must be between 1 and 200000")
+        if max_pages < 1 or max_pages > 20:
+            return invalid("max_pages must be between 1 and 20")
+        if normalized_action == "list_threads" and not 1 <= limit <= 200:
+            return invalid("list_threads limit must be between 1 and 200")
+        if normalized_action == "search" and not 1 <= limit <= 100:
+            return invalid("search limit must be between 1 and 100")
+        if normalized_action == "sync_from_notion" and not 1 <= limit <= 500:
+            return invalid("sync_from_notion limit must be between 1 and 500")
+        clean_thread_id = str(thread_id or "").strip()
+        if normalized_action in {"get_thread", "export_markdown", "hydrate_thread"} and not clean_thread_id:
+            return invalid(f"thread_id is required for {normalized_action}")
+        clean_query = str(query or "").strip()
+        if normalized_action == "search" and not clean_query:
+            return invalid("query is required for search")
+        if len(clean_query) > 1_000:
+            return invalid("query must not exceed 1000 characters")
+
+        account_data = await client.get("/v1/notion/accounts")
+        provenance = _safe_chat_history_provenance(
+            account_data,
+            requested_account_index=account_index,
+        )
+        pagination: dict[str, Any] = {}
+
+        if normalized_action == "status":
+            data = await client.get("/chat-history/status")
+            result = {key: value for key, value in data.items() if key not in {"ok", "status_code"}}
+        elif normalized_action == "list_threads":
+            data = await client.get(
+                "/chat-history/threads",
+                params={"limit": limit, "offset": offset},
+            )
+            threads = data.get("threads") if isinstance(data.get("threads"), list) else []
+            result = {"threads": threads}
+            pagination = {
+                "limit": limit,
+                "offset": offset,
+                "returned": len(threads),
+                "next_offset": offset + len(threads),
+                "has_more": len(threads) == limit,
+            }
+        elif normalized_action == "get_thread":
+            from urllib.parse import quote
+
+            data = await client.get(f"/chat-history/threads/{quote(clean_thread_id, safe='')}")
+            result = _bounded_chat_history_thread(
+                {key: value for key, value in data.items() if key not in {"ok", "status_code"}},
+                message_limit=message_limit,
+            )
+        elif normalized_action == "search":
+            data = await client.get(
+                "/chat-history/search",
+                params={"q": clean_query, "limit": limit, "offset": offset},
+            )
+            results = data.get("results") if isinstance(data.get("results"), list) else []
+            result = {"results": results, "query": clean_query}
+            pagination = {
+                "limit": limit,
+                "offset": offset,
+                "returned": len(results),
+                "next_offset": offset + len(results),
+                "has_more": len(results) == limit,
+            }
+        elif normalized_action == "export_markdown":
+            from urllib.parse import quote
+
+            data = await client.get_text(
+                f"/chat-history/threads/{quote(clean_thread_id, safe='')}/markdown",
+                max_chars=content_limit,
+            )
+            result = {
+                "thread_id": clean_thread_id,
+                "markdown": str(data.get("text") or ""),
+                "content_chars": int(data.get("text_chars") or 0),
+                "content_truncated": bool(data.get("truncated")),
+            }
+        elif normalized_action == "model_stats":
+            data = await client.get("/chat-history/model-stats")
+            result = {key: value for key, value in data.items() if key not in {"ok", "status_code"}}
+        elif normalized_action == "sync_from_notion":
+            data = await client.post(
+                "/chat-history/sync/notion",
+                {
+                    "account_index": account_index,
+                    "limit": limit,
+                    "max_pages": max_pages,
+                    "hydrate": hydrate,
+                },
+            )
+            result = {key: value for key, value in data.items() if key not in {"ok", "status_code"}}
+        else:
+            from urllib.parse import quote
+
+            data = await client.post(
+                f"/chat-history/threads/{quote(clean_thread_id, safe='')}/hydrate",
+                {"account_index": account_index},
+            )
+            result = {key: value for key, value in data.items() if key not in {"ok", "status_code"}}
+
+        ok = bool(data.get("ok", False))
+        return ChatHistoryOutput(
+            ok=ok,
+            action=normalized_action,
+            status_code=data.get("status_code"),
+            result=result,
+            pagination=pagination,
+            provenance=provenance,
+            partial=_chat_history_partial_result(data),
+            idempotent=True,
+            error=None if ok else _error_summary(data),
+        )
+
+    @server.tool(name=_tool_name("notion2api_chat"), description=_tool_description("Submit a prompt to Notion2API using a durable session and return immediately with a pollable request_id. Terra is the default; omit model unless the user explicitly requests another. reasoning_effort is exact and model-specific; omit it for the live catalog default. Omit session_name to generate one. Continue by session_name, conversation_id, or continue_from_request_id."), structured_output=True)
     async def notion2api_chat(
         prompt: str,
         model: MCPModel = DEFAULT_MODEL,
+        reasoning_effort: MCPReasoningEffort = None,
         system_prompt: str | None = None,
         persist_remote_chat: bool = True,
         session_name: MCPSessionName = None,
@@ -4512,6 +5593,7 @@ def create_server(
         prepared = prepare_mcp_file_attachments(local_paths)
         payload = {
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "messages": messages,
             "stream": False,
             "conversation_id": resolved_conversation_id,
@@ -4585,6 +5667,7 @@ def create_server(
         file: TransferredFile,
         prompt: str,
         model: MCPModel = DEFAULT_MODEL,
+        reasoning_effort: MCPReasoningEffort = None,
         system_prompt: str | None = None,
         persist_remote_chat: bool = True,
         session_name: MCPSessionName = None,
@@ -4606,6 +5689,7 @@ def create_server(
         return await notion2api_chat(
             prompt=prompt,
             model=model,
+            reasoning_effort=reasoning_effort,
             system_prompt=system_prompt,
             persist_remote_chat=persist_remote_chat,
             session_name=session_name,
@@ -4669,10 +5753,11 @@ def create_server(
             if staged_path is not None:
                 cleanup_staged_mcp_file(staged_path, was_staged)
 
-    @server.tool(name=_tool_name("notion2api_chat_completion"), description=_tool_description("Submit explicit messages to Notion2API using a durable session and return immediately with a pollable request_id. Terra is the default; omit model unless the user explicitly requests another. Omit session_name to generate one. Continue by session_name, conversation_id, or continue_from_request_id."), structured_output=True)
+    @server.tool(name=_tool_name("notion2api_chat_completion"), description=_tool_description("Submit explicit messages to Notion2API using a durable session and return immediately with a pollable request_id. Terra is the default; omit model unless the user explicitly requests another. reasoning_effort is exact and model-specific; omit it for the live catalog default. Omit session_name to generate one. Continue by session_name, conversation_id, or continue_from_request_id."), structured_output=True)
     async def notion2api_chat_completion(
         messages: list[dict[str, Any]],
         model: MCPModel = DEFAULT_MODEL,
+        reasoning_effort: MCPReasoningEffort = None,
         persist_remote_chat: bool = True,
         session_name: MCPSessionName = None,
         conversation_id: str | None = None,
@@ -4710,6 +5795,7 @@ def create_server(
         prepared = prepare_mcp_file_attachments(local_paths)
         payload = {
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "messages": explicit_messages,
             "stream": False,
             "conversation_id": resolved_conversation_id,
@@ -4746,10 +5832,11 @@ def create_server(
             wait_seconds=wait_seconds,
         )
 
-    @server.tool(name=_tool_name("notion2api_responses"), description=_tool_description("Call Notion2API /v1/responses and return extracted output text plus the raw response. Terra is the default; omit model unless the user explicitly requests another."), structured_output=True)
+    @server.tool(name=_tool_name("notion2api_responses"), description=_tool_description("Call Notion2API /v1/responses and return extracted output text plus the raw response. Terra is the default; omit model unless the user explicitly requests another. reasoning_effort is exact and model-specific; omit it for the live catalog default."), structured_output=True)
     async def notion2api_responses(
         input_text: str,
         model: MCPModel = DEFAULT_MODEL,
+        reasoning_effort: MCPReasoningEffort = None,
         instructions: str | None = None,
         persist_remote_chat: bool = True,
         attachments: FileAttachments = None,
@@ -4780,6 +5867,7 @@ def create_server(
             )
         payload: dict[str, Any] = {
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "input": validated_input,
             "metadata": {
                 "persist_remote_chat": persist_remote_chat,
@@ -4812,13 +5900,25 @@ def create_server(
             error=str(exc),
         )
 
-    @server.tool(name=_tool_name("notion2api_hive_create_mission"), description=_tool_description("Create a durable Hive mission with parallel worker lanes and conversation bindings."), structured_output=True)
+    @server.tool(name=_tool_name("notion2api_hive_create_mission"), description=_tool_description("Create a durable Hive mission with parallel worker lanes and conversation bindings. workspace_id and user_id are required account-scope fields."), structured_output=True)
     async def notion2api_hive_create_mission(
-        title: str,
-        objective: str,
-        lifecycle_stage: str,
-        workspace_id: str,
-        user_id: str,
+        title: Annotated[str, Field(min_length=1, description="Mission title.")],
+        objective: Annotated[str, Field(min_length=1, description="Mission objective.")],
+        lifecycle_stage: Annotated[str, Field(min_length=1, description="Lifecycle stage for the mission.")],
+        workspace_id: Annotated[
+            str,
+            Field(
+                min_length=1,
+                description="Required Notion workspace id that owns this mission account binding.",
+            ),
+        ],
+        user_id: Annotated[
+            str,
+            Field(
+                min_length=1,
+                description="Required Notion user id that owns this mission account binding.",
+            ),
+        ],
         work_units: list[dict[str, Any]] | None = None,
         authority_ceiling: str = "A2",
         parent_context_id: str = "",
@@ -5194,11 +6294,17 @@ def create_server(
             error=str(exc),
         )
 
-    @server.tool(name=_tool_name("notion2api_hive_materialize_invocation"), description=_tool_description("Persist an invocation plan and, when coverage and governance-plan authorization gates pass, create a durable Hive mission with appointed-worker bindings, bounded leases, conversation bindings, and READY dispatch receipts."), structured_output=True)
+    @server.tool(name=_tool_name("notion2api_hive_materialize_invocation"), description=_tool_description("Persist an invocation plan and, when coverage and governance-plan authorization gates pass, create a durable Hive mission with appointed-worker bindings, bounded leases, conversation bindings, and READY dispatch receipts. workspace_id and user_id are required."), structured_output=True)
     async def notion2api_hive_materialize_invocation(
-        objective: str,
-        workspace_id: str,
-        user_id: str,
+        objective: Annotated[str, Field(min_length=1, description="Invocation objective.")],
+        workspace_id: Annotated[
+            str,
+            Field(min_length=1, description="Required Notion workspace id for mission account binding."),
+        ],
+        user_id: Annotated[
+            str,
+            Field(min_length=1, description="Required Notion user id for mission account binding."),
+        ],
         required_competencies: list[str] | None = None,
         writable_domains: list[str] | None = None,
         dependency_count: int = 0,
@@ -5632,6 +6738,25 @@ def create_server(
         except (HiveRuntimeError, ValueError) as exc:
             return _execution_error_snapshot(exc, execution_id)
 
+    @server.tool(name=_tool_name("notion2api_hive_reconcile_execution_outcome"), description=_tool_description("Resolve an OUTCOME_UNKNOWN guarded execution from durable provider/worker evidence without replaying the semantic adapter operation. The result may be COMPLETED, FAILED, or CANCELLED; reconciliation is idempotent and synchronizes the Phase 2 dispatch receipt."), structured_output=True)
+    async def notion2api_hive_reconcile_execution_outcome(
+        execution_id: str,
+        actor: str,
+        resolved_status: str,
+        evidence: dict[str, Any],
+        idempotency_key: str | None = None,
+    ) -> HiveExecutionSnapshot:
+        try:
+            return get_hive_execution_dispatcher_store().reconcile_outcome_unknown(
+                execution_id=execution_id,
+                actor=actor,
+                resolved_status=resolved_status,
+                evidence=evidence,
+                idempotency_key=idempotency_key,
+            )
+        except (HiveRuntimeError, ValueError) as exc:
+            return _execution_error_snapshot(exc, execution_id)
+
     @server.tool(name=_tool_name("notion2api_hive_recover_execution"), description=_tool_description("Governance-plan-authorized recovery for a stale CLAIMED or RUNNING guarded execution. Recovery reuses the persisted bounded request, increments the attempt ledger, remains idempotent, and finalizes a pending cancellation instead of rerunning it."), structured_output=True)
     async def notion2api_hive_recover_execution(
         execution_id: str,
@@ -5809,7 +6934,7 @@ def create_server(
         except (HiveRuntimeError, ValueError) as exc:
             return _external_effect_error_snapshot(exc)
 
-    @server.tool(name=_tool_name("notion2api_list_sessions"), description=_tool_description("List named persistent Notion2API MCP chat sessions with local and remote identifiers."), structured_output=True)
+    @server.tool(name=_tool_name("notion2api_list_sessions"), description=_tool_description("List named persistent Notion2API MCP chat sessions with local and remote identifiers and a preview-only retention plan."), structured_output=True)
     async def notion2api_list_sessions() -> ListSessionsOutput:
         records = _load_session_records()
         items = [
@@ -5822,7 +6947,65 @@ def create_server(
             default_session=AUTO_SESSION_LABEL,
             state_path=str(DEFAULT_SESSION_STATE_PATH),
             sessions=items,
+            retention=_build_session_retention_plan(records),
         )
+
+    @server.tool(
+        name=_tool_name("notion2api_manage_session_retention"),
+        description=_tool_description(
+            "Preview session-retention candidates or, only when apply=true, archive eligible bindings to append-only JSONL before removing them from the active session index. Active chat-job bindings, governance leader sessions, evidence-bound sessions, and records without timestamps are protected."
+        ),
+        structured_output=True,
+    )
+    async def notion2api_manage_session_retention(
+        apply: bool = False,
+        retention_days: int | None = None,
+        max_records: int | None = None,
+        applied_by: str = "ChatGPT user",
+    ) -> SessionRetentionOutput:
+        try:
+            with _SESSION_STATE_MUTEX:
+                records = _load_session_records()
+                plan = _build_session_retention_plan(
+                    records,
+                    retention_days=retention_days,
+                    max_records=max_records,
+                )
+                archive_path = _session_archive_path()
+                archive_receipt = {
+                    "archived": 0,
+                    "archive_path": str(archive_path),
+                }
+                retained = records
+                if apply and plan.get("candidates"):
+                    retained, archive_receipt = archive_and_filter_sessions(
+                        records,
+                        plan,
+                        archive_path=archive_path,
+                        applied_by=applied_by,
+                    )
+                    _save_session_records(retained, strict=True)
+            counts = dict(plan.get("counts") or {})
+            counts["retained"] = len(retained)
+            return SessionRetentionOutput(
+                ok=True,
+                applied=bool(apply and int(archive_receipt.get("archived") or 0)),
+                state_path=str(DEFAULT_SESSION_STATE_PATH),
+                archive_path=str(archive_receipt.get("archive_path") or archive_path),
+                policy=dict(plan.get("policy") or {}),
+                counts=counts,
+                protected=list(plan.get("protected") or []),
+                candidates=list(plan.get("candidates") or []),
+                archived=int(archive_receipt.get("archived") or 0),
+                retained=len(retained),
+            )
+        except Exception as exc:
+            return SessionRetentionOutput(
+                ok=False,
+                state_path=str(DEFAULT_SESSION_STATE_PATH),
+                archive_path=str(_session_archive_path()),
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
     @server.tool(name=_tool_name("notion2api_allow_unsafe_url_once"), description=_tool_description("Grant Notion's Allow once confirmation for pending connections.web.loadPage calls and resume the interrupted inference through runInferenceTranscript. Resolves the remote thread from a named MCP session unless notion_thread_id is provided."), structured_output=True)
     async def notion2api_allow_unsafe_url_once(

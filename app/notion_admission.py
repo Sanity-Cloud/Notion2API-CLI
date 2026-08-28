@@ -14,7 +14,10 @@ from typing import Any, Callable, Iterator
 from urllib.parse import urlparse
 
 from app.notion_admission_store import SharedAdmissionStore
-from app.notion_request_telemetry import NotionRequestTelemetryStore
+from app.notion_request_telemetry import (
+    NotionRequestTelemetryStore,
+    UsageQuotaExceededError,
+)
 
 
 class AdmissionError(RuntimeError):
@@ -615,9 +618,10 @@ class NotionAdmissionController:
                 )
                 if result.status == "throttled":
                     self._counters["throttled"] += 1
+                    self._counters["throttle_wait_events"] += 1
                     throttled_seconds += delay
                 else:
-                    self._counters["queued"] += 1
+                    self._counters["queue_wait_events"] += 1
                 self._sleep(delay)
         except Exception:
             try:
@@ -661,6 +665,7 @@ class NotionAdmissionController:
         )
         attempt_id = str(attempt_id or uuid.uuid4().hex)
         ticket = f"{threading.get_ident()}:{time.time_ns()}"
+        self._counters["queue_entries"] += 1
         started = self._clock()
         deadline = started + (self.queue_timeout if timeout_seconds is None else timeout_seconds)
         shared_lease_id = ""
@@ -714,16 +719,13 @@ class NotionAdmissionController:
             account_queue_depth = max(account_queue_depth, shared_account_depth)
             thread_queue_depth = max(thread_queue_depth, shared_thread_depth)
             if account_queue_depth or thread_queue_depth:
+                self._counters["queued_unique_jobs"] += 1
+                # Backward-compatible alias: queued now means unique queued jobs.
                 self._counters["queued"] += 1
 
             try:
                 while True:
                     now = self._clock()
-                    if now >= deadline:
-                        self._counters["timeouts"] += 1
-                        raise AdmissionTimeoutError(
-                            f"Timed out waiting for Notion admission after {now - started:.3f}s"
-                        )
                     account_head = self._account_queues[account_key][0] == ticket
                     thread_head = (
                         not thread_key or self._thread_queues[thread_key][0] == ticket
@@ -742,23 +744,17 @@ class NotionAdmissionController:
 
                     if account_head and thread_head and account_available and thread_available:
                         if token_delay > 0:
+                            if now >= deadline:
+                                self._counters["timeouts"] += 1
+                                raise AdmissionTimeoutError(
+                                    f"Timed out waiting for Notion admission after {now - started:.3f}s"
+                                )
                             self._counters["throttled"] += 1
+                            self._counters["throttle_wait_events"] += 1
                             sleep_for = min(token_delay, max(0.01, deadline - now))
                             throttled_seconds += sleep_for
                             self._condition.wait(timeout=sleep_for)
                             continue
-                        if bucket is not None:
-                            bucket.consume(now, admission_weight)
-                        self._account_queues[account_key].popleft()
-                        if not self._account_queues[account_key]:
-                            self._account_queues.pop(account_key, None)
-                        if thread_key:
-                            self._thread_queues[thread_key].popleft()
-                            if not self._thread_queues[thread_key]:
-                                self._thread_queues.pop(thread_key, None)
-                            self._thread_active.add(thread_key)
-                        self._account_inflight[account_key] += 1
-                        self._counters["admitted"] += 1
                         waited = max(0.0, self._clock() - started)
                         disposition = (
                             "throttled"
@@ -791,8 +787,23 @@ class NotionAdmissionController:
                         )
                         try:
                             _REQUEST_TELEMETRY.start(receipt.as_dict())
+                        except UsageQuotaExceededError:
+                            self._counters["quota_rejected"] += 1
+                            raise
                         except Exception:
                             self._counters["telemetry_start_failures"] += 1
+                        if bucket is not None:
+                            bucket.consume(now, admission_weight)
+                        self._account_queues[account_key].popleft()
+                        if not self._account_queues[account_key]:
+                            self._account_queues.pop(account_key, None)
+                        if thread_key:
+                            self._thread_queues[thread_key].popleft()
+                            if not self._thread_queues[thread_key]:
+                                self._thread_queues.pop(thread_key, None)
+                            self._thread_active.add(thread_key)
+                        self._account_inflight[account_key] += 1
+                        self._counters["admitted"] += 1
                         self._last_receipts.append(receipt.as_dict())
                         return AdmissionPermit(
                             self,
@@ -802,7 +813,13 @@ class NotionAdmissionController:
                             receipt=receipt,
                             shared_lease_id=shared_lease_id,
                         )
+                    if now >= deadline:
+                        self._counters["timeouts"] += 1
+                        raise AdmissionTimeoutError(
+                            f"Timed out waiting for Notion admission after {now - started:.3f}s"
+                        )
                     remaining = max(0.01, deadline - now)
+                    self._counters["queue_wait_events"] += 1
                     self._condition.wait(timeout=min(0.25, remaining))
             except Exception:
                 account_queue = self._account_queues.get(account_key)
@@ -933,6 +950,19 @@ class NotionAdmissionController:
         with self._condition:
             now = self._clock()
             self._prune_recent_unlocked(now)
+            counters = dict(self._counters)
+            for key in (
+                "queue_entries",
+                "queued_unique_jobs",
+                "queue_wait_events",
+                "throttle_wait_events",
+                "admitted",
+                "completed",
+                "failed",
+                "timeouts",
+            ):
+                counters.setdefault(key, 0)
+            counters.setdefault("queued", counters["queued_unique_jobs"])
             local = {
                 "enabled": True,
                 "account_capacity": self.capacity,
@@ -944,7 +974,19 @@ class NotionAdmissionController:
                 "thread_queue_depth": sum(len(queue) for queue in self._thread_queues.values()),
                 "active_idempotency_keys": len(self._active_idempotency),
                 "recent_idempotency_keys": len(self._recent_idempotency),
-                "counters": dict(self._counters),
+                "metric_schema_version": 2,
+                "counter_semantics": {
+                    "queue_entries": "admission requests entering the controller",
+                    "queued_unique_jobs": "distinct requests that observed queue depth",
+                    "queued": "backward-compatible alias of queued_unique_jobs",
+                    "queue_wait_events": "queue/recheck observations while waiting",
+                    "throttle_wait_events": "token-bucket or provider throttle waits",
+                    "admitted": "requests granted an admission permit",
+                    "completed": "admitted requests released successfully",
+                    "failed": "admitted requests released unsuccessfully",
+                    "timeouts": "requests that exceeded admission timeout",
+                },
+                "counters": counters,
                 "recent_receipts": list(self._last_receipts)[-20:],
             }
         try:
@@ -1271,6 +1313,11 @@ _GLOBAL_CONTROLLER = NotionAdmissionController()
 
 def get_notion_admission_controller() -> NotionAdmissionController:
     return _GLOBAL_CONTROLLER
+
+
+def get_notion_usage_store() -> NotionRequestTelemetryStore:
+    """Return the canonical durable usage/quota store used by admission."""
+    return _REQUEST_TELEMETRY
 
 
 def admitted_session(session: Any, owner: Any) -> AdmittedSession:

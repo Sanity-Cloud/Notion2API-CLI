@@ -535,6 +535,15 @@ async def sync_from_notion(request: Request) -> dict[str, Any]:
     scope, store = _account_store(client)
     operation_key = f"sync:{scope.account_key}"
     try:
+        fresh_lookup = None
+        if hydrate:
+            def fresh_lookup(candidates: dict[str, int | None]) -> set[str]:
+                return store.fresh_message_ids(
+                    candidates,
+                    workspace_id=getattr(client, "space_id", None),
+                    account_key=scope.account_key,
+                )
+
         bundle = await _run_singleflight(
             operation_key,
             sync_chat_history_from_notion,
@@ -543,6 +552,9 @@ async def sync_from_notion(request: Request) -> dict[str, Any]:
             max_pages=max_pages,
             hydrate=hydrate,
             existing_message_ids_lookup=store.existing_message_ids if hydrate else None,
+            fresh_message_ids_lookup=fresh_lookup,
+            store=store,
+            persist=True,
         )
     except OperationInProgress as exc:
         raise HTTPException(
@@ -559,7 +571,7 @@ async def sync_from_notion(request: Request) -> dict[str, Any]:
     except NotionUpstreamError as exc:
         raise _history_upstream_http_exception(exc, action="sync") from exc
 
-    imported = store.upsert_bundle(bundle)
+    imported = bundle.get("persist_result") if isinstance(bundle.get("persist_result"), dict) else {}
     summary = dict(bundle.get("sync_summary", {}))
     summary.update(
         {
@@ -567,6 +579,10 @@ async def sync_from_notion(request: Request) -> dict[str, Any]:
             "threads_updated": imported.get("threads_updated", 0),
             "messages_inserted": imported.get("messages_inserted", 0),
             "messages_updated": imported.get("messages_updated", 0),
+            "semantic_messages_inserted": imported.get("semantic_messages_inserted", 0),
+            "raw_records_inserted": imported.get("raw_records_inserted", 0),
+            "checkpoint_advanced": summary.get("checkpoint_advanced", False),
+            "sync_run_id": summary.get("sync_run_id"),
         }
     )
     return {
@@ -804,12 +820,20 @@ async def hydrate_thread(thread_id: str, request: Request) -> dict[str, Any]:
 
     operation_key = f"hydrate:{scope.account_key}:{thread_id}"
     try:
+        def fresh_lookup(candidates: dict[str, int | None]) -> set[str]:
+            return store.fresh_message_ids(
+                candidates,
+                workspace_id=getattr(client, "space_id", None),
+                account_key=scope.account_key,
+            )
+
         bundle = await _run_singleflight(
             operation_key,
             hydrate_thread_from_notion,
             client,
             thread,
             existing_message_ids_lookup=store.existing_message_ids,
+            fresh_message_ids_lookup=fresh_lookup,
         )
     except OperationInProgress as exc:
         raise HTTPException(
@@ -826,7 +850,14 @@ async def hydrate_thread(thread_id: str, request: Request) -> dict[str, Any]:
     except NotionUpstreamError as exc:
         raise _history_upstream_http_exception(exc, action="hydrate") from exc
 
-    imported = store.upsert_bundle(bundle)
+    imported = store.upsert_bundle(
+        bundle,
+        workspace_id=getattr(client, "space_id", None),
+        notion_user_id=getattr(client, "user_id", None) or getattr(client, "notion_user_id", None),
+        account_key=scope.account_key,
+        source_kind="notion_server_hydrate",
+        source_endpoint="syncRecordValuesSpaceInitial",
+    )
     hydrated = store.get_thread(thread_id)
     return {
         "account_key": scope.account_key,
@@ -942,6 +973,7 @@ def search(
     request: Request,
     q: str = Query(..., min_length=1),
     limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     account_index: int | None = Query(None, ge=0),
     account_profile: str | None = Query(None),
 ) -> dict[str, Any]:
@@ -954,7 +986,7 @@ def search(
             "account_key": scope.account_key,
             "account_profile": scope.profile_name,
             "db_path": store.db_path,
-            "results": store.search(q, limit=limit),
+            "results": store.search(q, limit=limit, offset=offset),
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -9,7 +9,25 @@ import sqlite3
 from typing import Any
 
 from app.account_scope import AccountScopeError, safe_account_key
-from app.chat_history.extractor import describe_thread_record, visible_message_role, visible_message_text
+from app.chat_history.extractor import (
+    describe_thread_record,
+    normalize_thread_message_record,
+    visible_message_role,
+    visible_message_text,
+)
+from app.chat_history.lossless_archive import (
+    advance_sync_cursor,
+    archive_schema_is_current,
+    begin_sync_run,
+    ensure_archive_schema,
+    finish_sync_run,
+    get_sync_cursor,
+    latest_message_version,
+    mark_server_omission,
+    message_ids_fresh_at_versions,
+    persist_raw_record,
+    persist_thread_message_record,
+)
 from app.model_registry import NOTION_MODEL_REVERSE_MAP
 
 LEGACY_ACCOUNT_KEY = "legacy"
@@ -51,6 +69,10 @@ CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_created
   ON chat_messages(thread_id, created_time, id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_role
   ON chat_messages(thread_id, role);
+CREATE INDEX IF NOT EXISTS idx_chat_threads_workspace
+  ON chat_threads(workspace_id, id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_workspace
+  ON chat_messages(workspace_id, thread_id, id);
 """
 
 MODEL_METADATA_COLUMNS: dict[str, str] = {
@@ -60,16 +82,39 @@ MODEL_METADATA_COLUMNS: dict[str, str] = {
     "model_provider": "TEXT",
 }
 
+THREAD_OWNERSHIP_COLUMNS: dict[str, str] = {
+    "account_key": "TEXT",
+    "workspace_id": "TEXT",
+    "notion_user_id": "TEXT",
+}
+
+MESSAGE_OWNERSHIP_COLUMNS: dict[str, str] = {
+    "account_key": "TEXT",
+    "workspace_id": "TEXT",
+    "notion_user_id": "TEXT",
+    "version": "INTEGER",
+    "last_version": "INTEGER",
+    "step_type": "TEXT",
+    "visible": "INTEGER",
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> list[str]:
+    existing = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    added: list[str] = []
+    for name, column_type in columns.items():
+        if name in existing:
+            continue
+        conn.execute(f'ALTER TABLE {table} ADD COLUMN "{name}" {column_type}')
+        added.append(name)
+    return added
+
 
 def _ensure_chat_message_columns(conn: sqlite3.Connection) -> list[str]:
     """Add columns introduced after the initial chat-history schema."""
-    existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()}
-    added: list[str] = []
-    for name, column_type in MODEL_METADATA_COLUMNS.items():
-        if name in existing:
-            continue
-        conn.execute(f'ALTER TABLE chat_messages ADD COLUMN "{name}" {column_type}')
-        added.append(name)
+    added = _ensure_columns(conn, "chat_messages", MODEL_METADATA_COLUMNS)
+    added.extend(_ensure_columns(conn, "chat_messages", MESSAGE_OWNERSHIP_COLUMNS))
+    added.extend(_ensure_columns(conn, "chat_threads", THREAD_OWNERSHIP_COLUMNS))
     return added
 
 
@@ -429,9 +474,16 @@ class ChatHistoryStore:
         self.account_key = str(account_key or "").strip()
         self.db_path = db_path or get_default_chat_history_db_path(self.account_key or None)
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
+        existing_store = os.path.isfile(self.db_path) and os.path.getsize(self.db_path) > 0
         with self._conn() as conn:
+            if existing_store and not archive_schema_is_current(conn):
+                raise RuntimeError(
+                    "existing chat-history schema requires controlled activation; "
+                    "run scripts/activate_chat_history_schema.py before starting the runtime"
+                )
             conn.executescript(DDL)
             _ensure_chat_message_columns(conn)
+            ensure_archive_schema(conn)
             self._bind_account_metadata(conn)
             conn.commit()
         self._ensure_indexes()
@@ -451,12 +503,39 @@ class ChatHistoryStore:
             (self.account_key,),
         )
 
+    def _ownership(
+        self,
+        *,
+        workspace_id: str | None = None,
+        notion_user_id: str | None = None,
+        account_key: str | None = None,
+    ) -> tuple[str, str, str | None]:
+        resolved_account = str(account_key or self.account_key or LEGACY_ACCOUNT_KEY).strip() or LEGACY_ACCOUNT_KEY
+        resolved_workspace = str(workspace_id or "").strip()
+        resolved_user = str(notion_user_id or "").strip() or None
+        # Canonical account keys are workspace_id:user_id. Derive row-level
+        # ownership from the shard binding when callers only provide account_key
+        # (notably live-turn recording). Synthetic/legacy keys remain unknown.
+        if (
+            (not resolved_workspace or not resolved_user)
+            and ":" in resolved_account
+            and not resolved_account.startswith("profile:")
+        ):
+            key_workspace, key_user = resolved_account.split(":", 1)
+            if not resolved_workspace and key_workspace.strip():
+                resolved_workspace = key_workspace.strip()
+            if not resolved_user and key_user.strip():
+                resolved_user = key_user.strip()
+        resolved_workspace = resolved_workspace or "unknown"
+        return resolved_account, resolved_workspace, resolved_user
+
     def _ensure_indexes(self) -> None:
         """Best-effort indexes; another process may hold the live archive DB."""
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             try:
                 conn.executescript(INDEX_DDL)
+                ensure_archive_schema(conn)
                 conn.commit()
             finally:
                 conn.close()
@@ -473,95 +552,206 @@ class ChatHistoryStore:
         finally:
             conn.close()
 
-    def upsert_bundle(self, bundle: dict[str, Any]) -> dict[str, int]:
+    def upsert_bundle(
+        self,
+        bundle: dict[str, Any],
+        *,
+        workspace_id: str | None = None,
+        notion_user_id: str | None = None,
+        account_key: str | None = None,
+        source_kind: str | None = None,
+        source_endpoint: str | None = None,
+        sync_run_id: str | None = None,
+    ) -> dict[str, int]:
         threads = bundle.get("threads", {})
         messages = bundle.get("messages", {})
+        thread_messages = bundle.get("thread_messages", {}) if isinstance(bundle.get("thread_messages"), dict) else {}
+        raw_records = bundle.get("raw_records", []) if isinstance(bundle.get("raw_records"), list) else []
+        account, workspace, user = self._ownership(
+            workspace_id=workspace_id,
+            notion_user_id=notion_user_id,
+            account_key=account_key,
+        )
+        # Prefer explicit ownership from the bundle when present.
+        if isinstance(bundle.get("workspace_id"), str) and bundle.get("workspace_id").strip():
+            workspace = bundle["workspace_id"].strip()
+        if isinstance(bundle.get("notion_user_id"), str) and bundle.get("notion_user_id").strip():
+            user = bundle["notion_user_id"].strip()
         result = {
-            "threads": len(threads),
-            "messages": len(messages),
+            "threads": len(threads) if isinstance(threads, dict) else 0,
+            "messages": len(messages) if isinstance(messages, dict) else 0,
             "threads_inserted": 0,
             "threads_updated": 0,
             "messages_inserted": 0,
             "messages_updated": 0,
             "threads_skipped": 0,
             "messages_skipped": 0,
+            "raw_records_inserted": 0,
+            "semantic_messages_inserted": 0,
+            "semantic_messages_updated": 0,
+            "parts_written": 0,
         }
         with self._conn() as conn:
-            for t in threads.values():
-                if not isinstance(t, dict):
-                    result["threads_skipped"] += 1
-                    continue
-                thread_id = _id_text(t.get("id"))
-                if not thread_id:
-                    result["threads_skipped"] += 1
-                    continue
-                proposed = (
-                    _text(t.get("title")),
-                    _text(t.get("created_time")),
-                    _text(t.get("last_edited_time") or t.get("updated_at")),
-                    None if t.get("alive") is None else int(bool(t.get("alive"))),
-                    _message_ids_json(t.get("message_ids")),
-                    _json_dumps(t.get("raw"), {}),
-                )
-                existing = conn.execute(
-                    "SELECT title,created_time,last_edited_time,alive,message_ids_json,raw_json FROM chat_threads WHERE id=?",
-                    (thread_id,),
-                ).fetchone()
-                conn.execute(
-                    """INSERT INTO chat_threads(id,title,created_time,last_edited_time,alive,message_ids_json,raw_json)
-                    VALUES(?,?,?,?,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET title=excluded.title,last_edited_time=excluded.last_edited_time,alive=excluded.alive,message_ids_json=excluded.message_ids_json,raw_json=excluded.raw_json""",
-                    (thread_id, *proposed),
-                )
-                if existing is None:
-                    result["threads_inserted"] += 1
-                elif tuple(existing) != proposed:
-                    result["threads_updated"] += 1
-            for m in messages.values():
-                if not isinstance(m, dict):
-                    result["messages_skipped"] += 1
-                    continue
-                message_id = _id_text(m.get("id"))
-                if not message_id:
-                    result["messages_skipped"] += 1
-                    continue
-                thread_id = _id_text(m.get("thread_id"))
-                role = _text(m.get("role"))
-                text = _text(m.get("text"))
-                created_time = _text(m.get("created_time"))
-                metadata = _message_model_metadata(m)
-                proposed = (
-                    thread_id,
-                    role,
-                    text,
-                    created_time,
-                    _text(metadata.get("requested_model")),
-                    _text(metadata.get("notion_requested_model")),
-                    _text(metadata.get("actual_model")),
-                    _text(metadata.get("model_provider")),
-                    _json_dumps(m.get("raw"), {}),
-                )
-                existing = conn.execute(
-                    "SELECT thread_id,role,text,created_time,requested_model,notion_requested_model,actual_model,model_provider,raw_json FROM chat_messages WHERE id=?",
-                    (message_id,),
-                ).fetchone()
-                changed = existing is None or tuple(existing) != proposed
-                if changed:
+            ensure_archive_schema(conn)
+            if isinstance(threads, dict):
+                for t in threads.values():
+                    if not isinstance(t, dict):
+                        result["threads_skipped"] += 1
+                        continue
+                    thread_id = _id_text(t.get("id"))
+                    if not thread_id:
+                        result["threads_skipped"] += 1
+                        continue
+                    thread_workspace = _text(t.get("workspace_id") or workspace)
+                    proposed = (
+                        _text(t.get("title")),
+                        _text(t.get("created_time")),
+                        _text(t.get("last_edited_time") or t.get("updated_at")),
+                        None if t.get("alive") is None else int(bool(t.get("alive"))),
+                        _message_ids_json(t.get("message_ids")),
+                        _json_dumps(t.get("raw"), {}),
+                        account,
+                        thread_workspace,
+                        user,
+                    )
+                    existing = conn.execute(
+                        "SELECT title,created_time,last_edited_time,alive,message_ids_json,raw_json,account_key,workspace_id,notion_user_id FROM chat_threads WHERE id=?",
+                        (thread_id,),
+                    ).fetchone()
                     conn.execute(
-                        """INSERT INTO chat_messages(id,thread_id,role,text,created_time,requested_model,notion_requested_model,actual_model,model_provider,raw_json)
+                        """INSERT INTO chat_threads(id,title,created_time,last_edited_time,alive,message_ids_json,raw_json,account_key,workspace_id,notion_user_id)
                         VALUES(?,?,?,?,?,?,?,?,?,?)
-                        ON CONFLICT(id) DO UPDATE SET thread_id=excluded.thread_id,role=excluded.role,text=excluded.text,created_time=excluded.created_time,requested_model=excluded.requested_model,notion_requested_model=excluded.notion_requested_model,actual_model=excluded.actual_model,model_provider=excluded.model_provider,raw_json=excluded.raw_json""",
-                        (message_id, *proposed),
+                        ON CONFLICT(id) DO UPDATE SET title=excluded.title,last_edited_time=excluded.last_edited_time,alive=excluded.alive,message_ids_json=excluded.message_ids_json,raw_json=excluded.raw_json,account_key=COALESCE(excluded.account_key, chat_threads.account_key),workspace_id=COALESCE(excluded.workspace_id, chat_threads.workspace_id),notion_user_id=COALESCE(excluded.notion_user_id, chat_threads.notion_user_id)""",
+                        (thread_id, *proposed),
                     )
-                    conn.execute("DELETE FROM chat_messages_fts WHERE id=?", (message_id,))
-                    conn.execute(
-                        "INSERT INTO chat_messages_fts(id,thread_id,role,text) VALUES(?,?,?,?)",
-                        (message_id, thread_id, role, text),
+                    if existing is None:
+                        result["threads_inserted"] += 1
+                    elif tuple(existing) != proposed:
+                        result["threads_updated"] += 1
+            if isinstance(messages, dict):
+                for m in messages.values():
+                    if not isinstance(m, dict):
+                        result["messages_skipped"] += 1
+                        continue
+                    message_id = _id_text(m.get("id"))
+                    if not message_id:
+                        result["messages_skipped"] += 1
+                        continue
+                    thread_id = _id_text(m.get("thread_id"))
+                    role = _text(m.get("role"))
+                    text = _text(m.get("text"))
+                    created_time = _text(m.get("created_time"))
+                    metadata = _message_model_metadata(m)
+                    message_workspace = _text(m.get("workspace_id") or workspace)
+                    version = m.get("version")
+                    last_version = m.get("last_version")
+                    step_type = _text(m.get("step_type")) or None
+                    visible_flag = 1 if m.get("visible", True) else 0
+                    proposed = (
+                        thread_id,
+                        role,
+                        text,
+                        created_time,
+                        _text(metadata.get("requested_model")),
+                        _text(metadata.get("notion_requested_model")),
+                        _text(metadata.get("actual_model")),
+                        _text(metadata.get("model_provider")),
+                        _json_dumps(m.get("raw"), {}),
+                        account,
+                        message_workspace,
+                        user,
+                        version,
+                        last_version,
+                        step_type,
+                        visible_flag,
                     )
-                if existing is None:
-                    result["messages_inserted"] += 1
-                elif changed:
-                    result["messages_updated"] += 1
+                    existing = conn.execute(
+                        "SELECT thread_id,role,text,created_time,requested_model,notion_requested_model,actual_model,model_provider,raw_json,account_key,workspace_id,notion_user_id,version,last_version,step_type,visible FROM chat_messages WHERE id=?",
+                        (message_id,),
+                    ).fetchone()
+                    changed = existing is None or tuple(existing) != proposed
+                    if changed:
+                        conn.execute(
+                            """INSERT INTO chat_messages(id,thread_id,role,text,created_time,requested_model,notion_requested_model,actual_model,model_provider,raw_json,account_key,workspace_id,notion_user_id,version,last_version,step_type,visible)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(id) DO UPDATE SET thread_id=excluded.thread_id,role=excluded.role,text=excluded.text,created_time=excluded.created_time,requested_model=excluded.requested_model,notion_requested_model=excluded.notion_requested_model,actual_model=excluded.actual_model,model_provider=excluded.model_provider,raw_json=excluded.raw_json,account_key=COALESCE(excluded.account_key, chat_messages.account_key),workspace_id=COALESCE(excluded.workspace_id, chat_messages.workspace_id),notion_user_id=COALESCE(excluded.notion_user_id, chat_messages.notion_user_id),version=excluded.version,last_version=excluded.last_version,step_type=excluded.step_type,visible=excluded.visible""",
+                            (message_id, *proposed),
+                        )
+                        conn.execute("DELETE FROM chat_messages_fts WHERE id=?", (message_id,))
+                        conn.execute(
+                            "INSERT INTO chat_messages_fts(id,thread_id,role,text) VALUES(?,?,?,?)",
+                            (message_id, thread_id, role, text),
+                        )
+                    if existing is None:
+                        result["messages_inserted"] += 1
+                    elif changed:
+                        result["messages_updated"] += 1
+
+            # Promote visible-only messages into semantic records when callers omit thread_messages.
+            semantic_records = dict(thread_messages)
+            if isinstance(messages, dict):
+                for message_id, message in messages.items():
+                    if message_id in semantic_records or not isinstance(message, dict):
+                        continue
+                    raw = message.get("raw") if isinstance(message.get("raw"), dict) else message
+                    record = normalize_thread_message_record(str(message_id), raw, fallback_thread_id=_id_text(message.get("thread_id")))
+                    if record:
+                        semantic_records[record["id"]] = record
+
+            for raw_record in raw_records:
+                if not isinstance(raw_record, dict):
+                    continue
+                record_id = _id_text(raw_record.get("record_id"))
+                table_name = str(raw_record.get("table_name") or "unknown").strip() or "unknown"
+                if not record_id:
+                    continue
+                row_workspace = str(raw_record.get("workspace_id") or workspace).strip() or workspace
+                inserted = persist_raw_record(
+                    conn,
+                    account_key=account,
+                    workspace_id=row_workspace,
+                    notion_user_id=user,
+                    table_name=table_name,
+                    record_id=record_id,
+                    version=raw_record.get("version"),
+                    last_version=raw_record.get("last_version"),
+                    raw=raw_record.get("raw") or {},
+                    source_kind=str(raw_record.get("source_kind") or source_kind or "bundle"),
+                    source_endpoint=str(raw_record.get("source_endpoint") or source_endpoint or "") or None,
+                    sync_run_id=sync_run_id,
+                )
+                if inserted:
+                    result["raw_records_inserted"] += 1
+
+            for record in semantic_records.values():
+                if not isinstance(record, dict):
+                    continue
+                row_workspace = str(record.get("workspace_id") or workspace).strip() or workspace
+                # Always mirror semantic raw into versioned raw_notion_records.
+                persist_raw_record(
+                    conn,
+                    account_key=account,
+                    workspace_id=row_workspace,
+                    notion_user_id=user,
+                    table_name="thread_message",
+                    record_id=str(record.get("id") or ""),
+                    version=record.get("version"),
+                    last_version=record.get("last_version"),
+                    raw=record.get("raw_wrapper") or record.get("raw") or {},
+                    source_kind=source_kind or "bundle",
+                    source_endpoint=source_endpoint,
+                    sync_run_id=sync_run_id,
+                )
+                semantic_result = persist_thread_message_record(
+                    conn,
+                    account_key=account,
+                    workspace_id=row_workspace,
+                    notion_user_id=user,
+                    record=record,
+                )
+                result["semantic_messages_inserted"] += semantic_result["messages_inserted"]
+                result["semantic_messages_updated"] += semantic_result["messages_updated"]
+                result["parts_written"] += semantic_result["parts_written"]
             conn.commit()
         return result
 
@@ -582,6 +772,7 @@ class ChatHistoryStore:
         if not isinstance(threads, dict) or not isinstance(messages, dict):
             return result
 
+        account, workspace, user = self._ownership()
         with self._conn() as conn:
             for thread in threads.values():
                 if not isinstance(thread, dict):
@@ -592,7 +783,7 @@ class ChatHistoryStore:
                     result["threads_skipped"] += 1
                     continue
                 existing = conn.execute(
-                    "SELECT title,created_time,last_edited_time,alive,message_ids_json,raw_json FROM chat_threads WHERE id=?",
+                    "SELECT title,created_time,last_edited_time,alive,message_ids_json,raw_json,account_key,workspace_id,notion_user_id FROM chat_threads WHERE id=?",
                     (thread_id,),
                 ).fetchone()
                 existing_ids = json.loads((existing["message_ids_json"] if existing else None) or "[]")
@@ -633,15 +824,18 @@ class ChatHistoryStore:
                     _json_dumps(merged_raw, {}),
                 )
                 conn.execute(
-                    """INSERT INTO chat_threads(id,title,created_time,last_edited_time,alive,message_ids_json,raw_json)
-                    VALUES(?,?,?,?,?,?,?)
+                    """INSERT INTO chat_threads(id,title,created_time,last_edited_time,alive,message_ids_json,raw_json,account_key,workspace_id,notion_user_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(id) DO UPDATE SET
                       title=CASE WHEN TRIM(COALESCE(excluded.title,''))='' THEN chat_threads.title ELSE excluded.title END,
                       last_edited_time=excluded.last_edited_time,
                       alive=excluded.alive,
                       message_ids_json=excluded.message_ids_json,
-                      raw_json=excluded.raw_json""",
-                    (thread_id, *proposed),
+                      raw_json=excluded.raw_json,
+                      account_key=COALESCE(excluded.account_key, chat_threads.account_key),
+                      workspace_id=COALESCE(excluded.workspace_id, chat_threads.workspace_id),
+                      notion_user_id=COALESCE(excluded.notion_user_id, chat_threads.notion_user_id)""",
+                    (thread_id, *proposed, account, workspace, user),
                 )
                 if existing is None:
                     result["threads_inserted"] += 1
@@ -662,7 +856,7 @@ class ChatHistoryStore:
                 created_time = _text(message.get("created_time"))
                 metadata = _message_model_metadata(message)
                 existing = conn.execute(
-                    "SELECT thread_id,role,text,created_time,requested_model,notion_requested_model,actual_model,model_provider,raw_json FROM chat_messages WHERE id=?",
+                    "SELECT thread_id,role,text,created_time,requested_model,notion_requested_model,actual_model,model_provider,raw_json,account_key,workspace_id,notion_user_id FROM chat_messages WHERE id=?",
                     (message_id,),
                 ).fetchone()
                 if existing is not None and str(existing["text"] or "").strip():
@@ -687,13 +881,17 @@ class ChatHistoryStore:
                         actual,
                         provider,
                         _json_dumps(existing_raw, {}),
+                        _text(existing["account_key"]) or account,
+                        _text(existing["workspace_id"]) or workspace,
+                        _text(existing["notion_user_id"]) or user,
                     )
                     changed = tuple(existing) != proposed
                     if changed:
                         conn.execute(
                             """UPDATE chat_messages
                             SET thread_id=?, role=?, text=?, created_time=?,
-                                requested_model=?, notion_requested_model=?, actual_model=?, model_provider=?, raw_json=?
+                                requested_model=?, notion_requested_model=?, actual_model=?, model_provider=?, raw_json=?,
+                                account_key=?, workspace_id=?, notion_user_id=?
                             WHERE id=?""",
                             (*proposed, message_id),
                         )
@@ -712,11 +910,14 @@ class ChatHistoryStore:
                     _text(metadata.get("actual_model")),
                     _text(metadata.get("model_provider")),
                     _json_dumps(message.get("raw"), {}),
+                    account,
+                    workspace,
+                    user,
                 )
                 conn.execute(
-                    """INSERT INTO chat_messages(id,thread_id,role,text,created_time,requested_model,notion_requested_model,actual_model,model_provider,raw_json)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET thread_id=excluded.thread_id,role=excluded.role,text=excluded.text,created_time=excluded.created_time,requested_model=excluded.requested_model,notion_requested_model=excluded.notion_requested_model,actual_model=excluded.actual_model,model_provider=excluded.model_provider,raw_json=excluded.raw_json""",
+                    """INSERT INTO chat_messages(id,thread_id,role,text,created_time,requested_model,notion_requested_model,actual_model,model_provider,raw_json,account_key,workspace_id,notion_user_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET thread_id=excluded.thread_id,role=excluded.role,text=excluded.text,created_time=excluded.created_time,requested_model=excluded.requested_model,notion_requested_model=excluded.notion_requested_model,actual_model=excluded.actual_model,model_provider=excluded.model_provider,raw_json=excluded.raw_json,account_key=COALESCE(excluded.account_key,chat_messages.account_key),workspace_id=COALESCE(excluded.workspace_id,chat_messages.workspace_id),notion_user_id=COALESCE(excluded.notion_user_id,chat_messages.notion_user_id)""",
                     (message_id, *proposed),
                 )
                 conn.execute("DELETE FROM chat_messages_fts WHERE id=?", (message_id,))
@@ -732,7 +933,11 @@ class ChatHistoryStore:
         return result
 
     def existing_message_ids(self, message_ids: list[Any]) -> set[str]:
-        """Return message IDs that already have durable text in the local archive."""
+        """Return message IDs that already have durable text in the local archive.
+
+        Legacy helper used by visible-transcript hydration. Prefer
+        fresh_message_ids()/message_ids_needing_hydration() for version-aware sync.
+        """
         ids = _clean_ids(message_ids)
         if not ids:
             return set()
@@ -751,6 +956,284 @@ class ChatHistoryStore:
                 ).fetchall()
                 existing.update(str(row["id"]) for row in rows)
         return existing
+
+    def fresh_message_ids(
+        self,
+        candidates: dict[str, Any] | list[Any],
+        *,
+        workspace_id: str | None = None,
+        account_key: str | None = None,
+    ) -> set[str]:
+        """Return IDs that are present and not stale relative to candidate versions.
+
+        ``candidates`` may be a list of IDs (presence-only) or a mapping of
+        message_id -> server version.
+        """
+        if isinstance(candidates, dict):
+            versioned = {
+                str(message_id).strip(): candidates[message_id]
+                for message_id in candidates
+                if str(message_id or "").strip()
+            }
+        else:
+            versioned = {message_id: None for message_id in _clean_ids(list(candidates))}
+        if not versioned:
+            return set()
+        account, workspace, _user = self._ownership(workspace_id=workspace_id, account_key=account_key)
+        with self._conn() as conn:
+            ensure_archive_schema(conn)
+            fresh = message_ids_fresh_at_versions(
+                conn,
+                account_key=account,
+                workspace_id=workspace,
+                candidates=versioned,
+            )
+            # Fall back to visible archive presence only for a genuinely
+            # pre-lossless account/workspace. Once any semantic server records
+            # exist in this scope, flattened chat_messages rows are projections,
+            # not authoritative evidence, and must never suppress hydration of a
+            # missing agent-inference/thread_message.
+            has_semantic_archive = conn.execute(
+                """
+                SELECT 1
+                FROM notion_thread_messages
+                WHERE account_key=? AND workspace_id=?
+                LIMIT 1
+                """,
+                (account, workspace),
+            ).fetchone() is not None
+            if not has_semantic_archive:
+                presence_only_ids = [
+                    message_id
+                    for message_id, version in versioned.items()
+                    if message_id not in fresh and version in (None, -1)
+                ]
+                if presence_only_ids:
+                    fresh |= self.existing_message_ids(presence_only_ids)
+            return fresh
+
+    def message_ids_needing_hydration(
+        self,
+        candidates: dict[str, Any] | list[Any],
+        *,
+        workspace_id: str | None = None,
+        account_key: str | None = None,
+    ) -> set[str]:
+        if isinstance(candidates, dict):
+            all_ids = {str(message_id).strip() for message_id in candidates if str(message_id or "").strip()}
+        else:
+            all_ids = set(_clean_ids(list(candidates)))
+        fresh = self.fresh_message_ids(candidates, workspace_id=workspace_id, account_key=account_key)
+        return all_ids - fresh
+
+    def archived_message_version(
+        self,
+        message_id: str,
+        *,
+        workspace_id: str | None = None,
+        account_key: str | None = None,
+    ) -> int | None:
+        account, workspace, _user = self._ownership(workspace_id=workspace_id, account_key=account_key)
+        with self._conn() as conn:
+            ensure_archive_schema(conn)
+            return latest_message_version(
+                conn,
+                account_key=account,
+                workspace_id=workspace,
+                message_id=str(message_id),
+            )
+
+    def begin_sync_run(
+        self,
+        sync_run_id: str,
+        *,
+        workspace_id: str | None = None,
+        notion_user_id: str | None = None,
+        account_key: str | None = None,
+        source_kind: str = "notion_server",
+    ) -> None:
+        account, workspace, user = self._ownership(
+            workspace_id=workspace_id,
+            notion_user_id=notion_user_id,
+            account_key=account_key,
+        )
+        with self._conn() as conn:
+            ensure_archive_schema(conn)
+            begin_sync_run(
+                conn,
+                sync_run_id=sync_run_id,
+                account_key=account,
+                workspace_id=workspace,
+                notion_user_id=user,
+                source_kind=source_kind,
+            )
+            conn.commit()
+
+    def finish_sync_run(
+        self,
+        sync_run_id: str,
+        *,
+        status: str,
+        pages_scanned: int = 0,
+        records_persisted: int = 0,
+        hydration_failed: int = 0,
+        hydration_partial: int = 0,
+        checkpoint_advanced: bool = False,
+        metrics: dict[str, Any] | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        with self._conn() as conn:
+            ensure_archive_schema(conn)
+            finish_sync_run(
+                conn,
+                sync_run_id=sync_run_id,
+                status=status,
+                pages_scanned=pages_scanned,
+                records_persisted=records_persisted,
+                hydration_failed=hydration_failed,
+                hydration_partial=hydration_partial,
+                checkpoint_advanced=checkpoint_advanced,
+                metrics=metrics,
+                error_text=error_text,
+            )
+            conn.commit()
+
+    def get_sync_cursor(
+        self,
+        cursor_name: str,
+        *,
+        workspace_id: str | None = None,
+        account_key: str | None = None,
+    ) -> str | None:
+        account, workspace, _user = self._ownership(workspace_id=workspace_id, account_key=account_key)
+        with self._conn() as conn:
+            ensure_archive_schema(conn)
+            return get_sync_cursor(
+                conn,
+                account_key=account,
+                workspace_id=workspace,
+                cursor_name=cursor_name,
+            )
+
+    def advance_sync_cursor(
+        self,
+        cursor_name: str,
+        cursor_value: str | None,
+        *,
+        sync_run_id: str | None = None,
+        workspace_id: str | None = None,
+        account_key: str | None = None,
+        allow_advance: bool = True,
+        expected_cursor_value: str | None = None,
+        enforce_expected_cursor: bool = False,
+    ) -> bool:
+        account, workspace, _user = self._ownership(workspace_id=workspace_id, account_key=account_key)
+        with self._conn() as conn:
+            ensure_archive_schema(conn)
+            advanced = advance_sync_cursor(
+                conn,
+                account_key=account,
+                workspace_id=workspace,
+                cursor_name=cursor_name,
+                cursor_value=cursor_value,
+                sync_run_id=sync_run_id,
+                allow_advance=allow_advance,
+                expected_cursor_value=expected_cursor_value,
+                enforce_expected_cursor=enforce_expected_cursor,
+            )
+            conn.commit()
+            return advanced
+
+    def mark_server_omission(
+        self,
+        *,
+        table_name: str,
+        record_id: str,
+        workspace_id: str | None = None,
+        account_key: str | None = None,
+        sync_run_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        account, workspace, _user = self._ownership(workspace_id=workspace_id, account_key=account_key)
+        with self._conn() as conn:
+            ensure_archive_schema(conn)
+            mark_server_omission(
+                conn,
+                account_key=account,
+                workspace_id=workspace,
+                sync_run_id=sync_run_id,
+                table_name=table_name,
+                record_id=record_id,
+                details=details,
+            )
+            conn.commit()
+
+    def list_thread_messages(
+        self,
+        thread_id: str,
+        *,
+        workspace_id: str | None = None,
+        account_key: str | None = None,
+        visible_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return latest semantic thread_message rows for a thread (hidden included by default)."""
+        account, workspace, _user = self._ownership(workspace_id=workspace_id, account_key=account_key)
+        with self._conn() as conn:
+            ensure_archive_schema(conn)
+            rows = conn.execute(
+                """
+                SELECT n.*
+                FROM notion_thread_messages n
+                JOIN (
+                  SELECT message_id, MAX(version) AS max_version
+                  FROM notion_thread_messages
+                  WHERE account_key=? AND workspace_id=? AND thread_id=?
+                  GROUP BY message_id
+                ) latest
+                  ON latest.message_id = n.message_id AND latest.max_version = n.version
+                WHERE n.account_key=? AND n.workspace_id=? AND n.thread_id=?
+                ORDER BY COALESCE(n.created_time, ''), n.message_id
+                """,
+                (account, workspace, thread_id, account, workspace, thread_id),
+            ).fetchall()
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                if visible_only and not int(item.get("visible") or 0):
+                    continue
+                out.append(item)
+            return out
+
+    def list_message_parts(
+        self,
+        message_id: str,
+        *,
+        workspace_id: str | None = None,
+        account_key: str | None = None,
+        version: int | None = None,
+    ) -> list[dict[str, Any]]:
+        account, workspace, _user = self._ownership(workspace_id=workspace_id, account_key=account_key)
+        with self._conn() as conn:
+            ensure_archive_schema(conn)
+            resolved_version = version
+            if resolved_version is None:
+                resolved_version = latest_message_version(
+                    conn,
+                    account_key=account,
+                    workspace_id=workspace,
+                    message_id=message_id,
+                )
+            if resolved_version is None:
+                return []
+            rows = conn.execute(
+                """
+                SELECT * FROM notion_message_parts
+                WHERE account_key=? AND workspace_id=? AND message_id=? AND message_version=?
+                ORDER BY ordinal ASC
+                """,
+                (account, workspace, message_id, resolved_version),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def existing_thread_ids(self, thread_ids: list[Any]) -> set[str]:
         ids = _clean_ids(thread_ids)
@@ -1191,17 +1674,17 @@ class ChatHistoryStore:
             return {"thread_exists": False, "message_count": 0, "raw_fields_seen": [], "known_message_fields_found": [], "sample": {}}
         return describe_thread_record(thread, thread.get("messages") or [])
 
-    def search(self, query: str, limit: int = 25) -> list[dict[str, Any]]:
+    def search(self, query: str, limit: int = 25, offset: int = 0) -> list[dict[str, Any]]:
         query = str(query or "").strip()
         if not query:
             return []
-        sql = "SELECT id,thread_id,role,snippet(chat_messages_fts,3,'[',']',' ... ',16) AS snippet FROM chat_messages_fts WHERE chat_messages_fts MATCH ? LIMIT ?"
+        sql = "SELECT id,thread_id,role,snippet(chat_messages_fts,3,'[',']',' ... ',16) AS snippet FROM chat_messages_fts WHERE chat_messages_fts MATCH ? ORDER BY bm25(chat_messages_fts), id LIMIT ? OFFSET ?"
         with self._conn() as conn:
             try:
-                rows = conn.execute(sql, (query, limit)).fetchall()
+                rows = conn.execute(sql, (query, limit, offset)).fetchall()
             except sqlite3.OperationalError:
                 try:
-                    rows = conn.execute(sql, (_quote_fts_phrase(query), limit)).fetchall()
+                    rows = conn.execute(sql, (_quote_fts_phrase(query), limit, offset)).fetchall()
                 except sqlite3.OperationalError as exc:
                     raise ValueError("Invalid chat-history search query") from exc
             return [dict(r) for r in rows]

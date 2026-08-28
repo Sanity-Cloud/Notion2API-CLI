@@ -58,9 +58,21 @@ test_*.py
 *_test.py
 debug_*.py
 
+# Allow this sanitized, synthetic chat-history contract fixture while keeping
+# every other untracked test artifact ignored.
+!tests/
+tests/*
+!tests/test_usage_quotas.py
+!tests/browser_consumer_terminal_contract.test.js
+!tests/fixtures/
+tests/fixtures/*
+!tests/fixtures/notion-chat-history-drift.json
+
 # Claude Code local settings
 .claude/settings.local.json
 .claude/worktrees/
+.worktrees/
+.codex-test-tmp/
 
 # Docker (Optional to ignore if you want to keep configs in git, usually we keep them)
 # But we definitely ignore local-specific overrides

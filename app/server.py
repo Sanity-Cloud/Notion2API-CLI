@@ -20,6 +20,7 @@ from app.api.hive_workforce import router as hive_workforce_router
 from app.api.models import router as models_router
 from app.api.responses import router as responses_router
 from app.api.notion import router as notion_router
+from app.api.usage import router as usage_router
 from app.attachments.runtime_config import apply_attachment_runtime_config
 from app.config import (
     ALLOWED_ORIGINS,
@@ -28,12 +29,18 @@ from app.config import (
     is_lite_mode,
     is_standard_mode,
 )
+from app.compression_observability import compression_telemetry_snapshot
 from app.conversation import ConversationManager
+from app.chat_history.contracts import runtime_history_contract
+from app.chat_history.lossless_archive import history_schema_hash
+from app.chat_history.store import get_chat_history_db_root
 from app.core.errors import openai_error_payload
 from app.core.internal_callers import is_repo_ai_internal_request
 from app.limiter import limiter
 from app.logger import logger, setup_uvicorn_logging
 from app.notion_admission import get_notion_admission_controller
+from app.notion_request_telemetry import UsageQuotaExceededError
+from app.request_control import RequestController
 
 
 apply_attachment_runtime_config()
@@ -61,6 +68,7 @@ async def lifespan(app: FastAPI):
     # text
     governed_accounts = get_governed_accounts()
     app.state.account_pool = AccountPool(governed_accounts)
+    app.state.request_control = RequestController.from_env()
     # Keep durable conversation storage available in every mode so chat-history
     # resume/fork can create real local conversations without forcing heavy mode.
     app.state.conversation_manager = ConversationManager()
@@ -138,6 +146,25 @@ def custom_rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded)
 
 
 app.add_exception_handler(RateLimitExceeded, custom_rate_limit_exceeded_handler)
+
+
+@app.exception_handler(UsageQuotaExceededError)
+async def usage_quota_exceeded_handler(request: Request, exc: UsageQuotaExceededError):
+    retry_after = max(1, int(exc.retry_after_seconds + 0.999))
+    return JSONResponse(
+        status_code=429,
+        headers={"Retry-After": str(retry_after)},
+        content={
+            "error": {
+                "message": "Operational usage quota exceeded",
+                "type": "rate_limit_error",
+                "code": "usage_quota_exceeded",
+                "quota_id": exc.quota_id,
+                "dimension": exc.dimension,
+                "retry_after_seconds": retry_after,
+            }
+        },
+    )
 
 
 @app.exception_handler(HTTPException)
@@ -243,6 +270,7 @@ app.include_router(features_router, prefix="/v1")
 app.include_router(hive_workforce_router, prefix="/v1")
 app.include_router(responses_router, prefix="/v1")
 app.include_router(notion_router, prefix="/v1")
+app.include_router(usage_router, prefix="/v1")
 
 
 # text
@@ -252,10 +280,17 @@ async def favicon():
 
 
 @app.get("/health", tags=["system"])
-def health_check(request: Request):
+async def health_check(request: Request):
     uptime = time.time() - request.app.state.start_time
     pool = request.app.state.account_pool
     status = pool.get_status_summary()
+    history_contract = runtime_history_contract(
+        conversation_store_path=request.app.state.conversation_manager.db_path,
+        history_store_root=get_chat_history_db_root(),
+        history_schema_hash=history_schema_hash(),
+    )
+    controller = getattr(request.app.state, "request_control", None)
+    request_control = await controller.snapshot() if controller is not None else {}
     return {
         "status": "ok",
         "accounts": status["active"],
@@ -265,12 +300,15 @@ def health_check(request: Request):
         "account_selection": pool.get_selection_summary(),
         "governance": pool.get_governance_summary(),
         "notion_admission": get_notion_admission_controller().snapshot(),
+        "history": history_contract,
+        "conversation_compression": compression_telemetry_snapshot(),
+        "request_control": request_control,
     }
 
 
 @app.get("/healthz", tags=["system"])
-def healthz(request: Request):
-    return health_check(request)
+async def healthz(request: Request):
+    return await health_check(request)
 
 
 frontend_dir = os.path.join(

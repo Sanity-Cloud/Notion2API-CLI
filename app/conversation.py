@@ -5,6 +5,11 @@ import sqlite3
 import uuid
 from typing import Any, Dict, List, Optional
 
+from app.account_scope import canonical_account_key
+from app.compression_observability import (
+    log_compression_warning,
+    record_compression_event,
+)
 from app.logger import logger
 from app.model_registry import get_thread_type, is_gemini_model
 
@@ -165,7 +170,50 @@ class ConversationManager:
             self._ensure_column(conn, "conversations", "profile_name TEXT")
             self._ensure_column(conn, "conversations", "publication_parent_page_id TEXT")
             self._ensure_column(conn, "conversations", "governance_contract_version TEXT")
+            # Additive ownership columns observed on some runtime DBs; keep code/schema aligned.
+            self._ensure_column(conn, "conversations", "account_key TEXT")
+            self._ensure_column(conn, "conversations", "notion_user_id TEXT")
+            self._ensure_column(conn, "conversations", "notion_space_id TEXT")
+            self._ensure_column(conn, "conversations", "notion_thread_id TEXT")
+            self._ensure_column(conn, "conversations", "account_scope TEXT")
+            self._ensure_column(conn, "conversations", "account_binding_status TEXT")
             self._ensure_column(conn, "messages", "thinking TEXT")
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_bindings (
+                    binding_id TEXT PRIMARY KEY,
+                    bee_id TEXT,
+                    hive_id TEXT,
+                    lane_id TEXT,
+                    assignment_id TEXT,
+                    conversation_id TEXT NOT NULL,
+                    account_key TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    notion_user_id TEXT,
+                    remote_thread_id TEXT NOT NULL,
+                    binding_generation INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    predecessor_binding_id TEXT,
+                    successor_binding_id TEXT,
+                    created_at INTEGER NOT NULL,
+                    retired_at INTEGER,
+                    UNIQUE(account_key, workspace_id, conversation_id, binding_generation),
+                    UNIQUE(account_key, workspace_id, remote_thread_id, binding_generation)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conversation_bindings_active
+                ON conversation_bindings(account_key, workspace_id, conversation_id, status, binding_generation DESC)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conversation_bindings_remote
+                ON conversation_bindings(account_key, workspace_id, remote_thread_id, status)
+                """
+            )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_conversations_chat_scope
@@ -176,6 +224,48 @@ class ConversationManager:
                 """
                 CREATE INDEX IF NOT EXISTS idx_conversations_page_scope
                 ON conversations(workspace_id, teamspace_id, created_at DESC)
+                """
+            )
+
+            # Keep the older workspace/user/thread columns and the newer explicit
+            # ownership aliases coherent.  This is additive and never guesses an
+            # account when either workspace or user identity is absent.
+            conn.execute(
+                """
+                UPDATE conversations
+                SET account_key = COALESCE(
+                        NULLIF(account_key, ''),
+                        CASE
+                          WHEN TRIM(COALESCE(workspace_id,'')) != ''
+                           AND TRIM(COALESCE(user_id,'')) != ''
+                          THEN workspace_id || ':' || user_id
+                          ELSE NULL
+                        END
+                    ),
+                    notion_user_id = COALESCE(NULLIF(notion_user_id,''), NULLIF(user_id,'')),
+                    notion_space_id = COALESCE(NULLIF(notion_space_id,''), NULLIF(workspace_id,'')),
+                    notion_thread_id = COALESCE(NULLIF(notion_thread_id,''), NULLIF(thread_id,'')),
+                    account_scope = COALESCE(
+                        NULLIF(account_scope,''),
+                        CASE
+                          WHEN TRIM(COALESCE(workspace_id,'')) != ''
+                           AND TRIM(COALESCE(user_id,'')) != ''
+                          THEN workspace_id || ':' || user_id
+                          ELSE NULL
+                        END
+                    ),
+                    account_binding_status = CASE
+                        WHEN TRIM(COALESCE(workspace_id,'')) != ''
+                         AND TRIM(COALESCE(user_id,'')) != ''
+                         AND TRIM(COALESCE(thread_id,'')) != '' THEN 'thread_bound'
+                        WHEN TRIM(COALESCE(workspace_id,'')) != ''
+                         AND TRIM(COALESCE(user_id,'')) != ''
+                         AND TRIM(COALESCE(account_binding_status,'')) = '' THEN 'account_bound'
+                        ELSE account_binding_status
+                    END
+                WHERE TRIM(COALESCE(workspace_id,'')) != ''
+                   OR TRIM(COALESCE(user_id,'')) != ''
+                   OR TRIM(COALESCE(thread_id,'')) != ''
                 """
             )
 
@@ -619,26 +709,40 @@ class ConversationManager:
         conv_id = str(conversation_id or "").strip() or str(uuid.uuid4())
         created_at = int(datetime.datetime.now().timestamp())
         clean_title = " ".join(str(title or "").split()).strip() or "New Chat"
+        clean_workspace = str(workspace_id or "").strip()
+        clean_user = str(user_id or "").strip()
+        account_key = (
+            canonical_account_key(clean_workspace, clean_user)
+            if clean_workspace and clean_user
+            else ""
+        )
         with self._get_conn() as conn:
             conn.execute(
                 """
                 INSERT INTO conversations (
                     id, title, created_at, next_round_index,
                     workspace_id, teamspace_id, user_id, profile_name,
-                    publication_parent_page_id, governance_contract_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    publication_parent_page_id, governance_contract_version,
+                    account_key, notion_user_id, notion_space_id, account_scope,
+                    account_binding_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conv_id,
                     clean_title,
                     created_at,
                     0,
-                    str(workspace_id or "").strip(),
+                    clean_workspace,
                     str(teamspace_id or "").strip(),
-                    str(user_id or "").strip(),
+                    clean_user,
                     str(profile_name or "").strip(),
                     str(publication_parent_page_id or "").strip(),
                     str(governance_contract_version or "").strip(),
+                    account_key or None,
+                    clean_user or None,
+                    clean_workspace or None,
+                    account_key or None,
+                    "account_bound" if account_key else None,
                 ),
             )
             conn.commit()
@@ -749,11 +853,17 @@ class ConversationManager:
                     "Legacy persistent conversation has no workspace/account binding; "
                     "fork it into a new chat instead of guessing its identity"
                 )
+            account_key = canonical_account_key(workspace_id, user_id)
             conn.execute(
                 """
                 UPDATE conversations
                 SET workspace_id = ?, teamspace_id = ?, user_id = ?, profile_name = ?,
-                    publication_parent_page_id = ?, governance_contract_version = ?
+                    publication_parent_page_id = ?, governance_contract_version = ?,
+                    account_key = ?, notion_user_id = ?, notion_space_id = ?,
+                    account_scope = ?, account_binding_status = CASE
+                        WHEN TRIM(COALESCE(thread_id,'')) != '' THEN 'thread_bound'
+                        ELSE 'account_bound'
+                    END
                 WHERE id = ?
                 """,
                 (
@@ -763,6 +873,10 @@ class ConversationManager:
                     str(profile_name or "").strip(),
                     str(publication_parent_page_id or "").strip(),
                     str(governance_contract_version or "").strip(),
+                    account_key,
+                    user_id,
+                    workspace_id,
+                    account_key,
                     conversation_id,
                 ),
             )
@@ -790,8 +904,23 @@ class ConversationManager:
     def clear_conversation_thread(self, conversation_id: str) -> None:
         """text thread_id text thread_modeltext Notion threadtext"""
         with self._get_conn() as conn:
+            now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
             conn.execute(
-                "UPDATE conversations SET thread_id = NULL, thread_model = NULL WHERE id = ?",
+                """
+                UPDATE conversation_bindings
+                SET status='retired', retired_at=COALESCE(retired_at, ?)
+                WHERE conversation_id=? AND status='active'
+                """,
+                (now, conversation_id),
+            )
+            conn.execute(
+                """UPDATE conversations
+                   SET thread_id = NULL, thread_model = NULL, notion_thread_id = NULL,
+                       account_binding_status = CASE
+                         WHEN TRIM(COALESCE(account_key,'')) != '' THEN 'account_bound'
+                         ELSE NULL
+                       END
+                   WHERE id = ?""",
                 (conversation_id,),
             )
             conn.commit()
@@ -812,17 +941,84 @@ class ConversationManager:
         model_name: Optional[str] = None,
     ) -> None:
         """text Notion thread_id text"""
+        resolved_thread = str(thread_id or "").strip()
+        if not resolved_thread:
+            raise ValueError("thread_id is required")
         with self._get_conn() as conn:
+            scope = conn.execute(
+                """SELECT workspace_id, user_id, account_key
+                   FROM conversations WHERE id=?""",
+                (conversation_id,),
+            ).fetchone()
+            if scope is None:
+                raise ValueError(f"Conversation ID '{conversation_id}' does not exist.")
+            workspace_id = str(scope["workspace_id"] or "").strip()
+            user_id = str(scope["user_id"] or "").strip()
+            account_key = str(scope["account_key"] or "").strip()
+            if workspace_id and user_id and not account_key:
+                account_key = canonical_account_key(workspace_id, user_id)
             if model_name is not None:
                 conn.execute(
-                    "UPDATE conversations SET thread_id = ?, thread_model = ? WHERE id = ?",
-                    (thread_id, model_name, conversation_id),
+                    """UPDATE conversations
+                       SET thread_id=?, thread_model=?, notion_thread_id=?,
+                           account_key=COALESCE(NULLIF(account_key,''), ?),
+                           notion_user_id=COALESCE(NULLIF(notion_user_id,''), NULLIF(user_id,'')),
+                           notion_space_id=COALESCE(NULLIF(notion_space_id,''), NULLIF(workspace_id,'')),
+                           account_scope=COALESCE(NULLIF(account_scope,''), ?),
+                           account_binding_status='thread_bound'
+                       WHERE id=?""",
+                    (resolved_thread, model_name, resolved_thread, account_key or None, account_key or None, conversation_id),
                 )
             else:
                 conn.execute(
-                    "UPDATE conversations SET thread_id = ? WHERE id = ?",
-                    (thread_id, conversation_id),
+                    """UPDATE conversations
+                       SET thread_id=?, notion_thread_id=?,
+                           account_key=COALESCE(NULLIF(account_key,''), ?),
+                           notion_user_id=COALESCE(NULLIF(notion_user_id,''), NULLIF(user_id,'')),
+                           notion_space_id=COALESCE(NULLIF(notion_space_id,''), NULLIF(workspace_id,'')),
+                           account_scope=COALESCE(NULLIF(account_scope,''), ?),
+                           account_binding_status='thread_bound'
+                       WHERE id=?""",
+                    (resolved_thread, resolved_thread, account_key or None, account_key or None, conversation_id),
                 )
+            if account_key and workspace_id:
+                active = conn.execute(
+                    """SELECT binding_id, remote_thread_id
+                       FROM conversation_bindings
+                       WHERE account_key=? AND workspace_id=? AND conversation_id=? AND status='active'
+                       ORDER BY binding_generation DESC LIMIT 1""",
+                    (account_key, workspace_id, conversation_id),
+                ).fetchone()
+                if active is not None and str(active["remote_thread_id"] or "") != resolved_thread:
+                    raise ValueError(
+                        "Conversation already has a different active Notion thread binding; "
+                        "retire it before replacing the remote thread"
+                    )
+                if active is None:
+                    generation_row = conn.execute(
+                        """SELECT COALESCE(MAX(binding_generation),0)
+                           FROM conversation_bindings
+                           WHERE account_key=? AND workspace_id=? AND conversation_id=?""",
+                        (account_key, workspace_id, conversation_id),
+                    ).fetchone()
+                    generation = int(generation_row[0] or 0) + 1
+                    conn.execute(
+                        """INSERT INTO conversation_bindings(
+                             binding_id, conversation_id, account_key, workspace_id,
+                             notion_user_id, remote_thread_id, binding_generation,
+                             status, created_at
+                           ) VALUES(?,?,?,?,?,?,?,'active',?)""",
+                        (
+                            str(uuid.uuid4()),
+                            conversation_id,
+                            account_key,
+                            workspace_id,
+                            user_id or None,
+                            resolved_thread,
+                            generation,
+                            int(datetime.datetime.now(datetime.timezone.utc).timestamp()),
+                        ),
+                    )
             conn.commit()
             logger.info(
                 "Saved thread_id for conversation",
@@ -830,11 +1026,147 @@ class ConversationManager:
                     "request_info": {
                         "event": "thread_id_saved",
                         "conversation_id": conversation_id,
-                        "thread_id": thread_id,
+                        "thread_id": resolved_thread,
                         "thread_model": model_name,
                     }
                 },
             )
+
+    def create_conversation_binding(
+        self,
+        *,
+        conversation_id: str,
+        account_key: str,
+        workspace_id: str,
+        remote_thread_id: str,
+        bee_id: str | None = None,
+        hive_id: str | None = None,
+        lane_id: str | None = None,
+        assignment_id: str | None = None,
+        notion_user_id: str | None = None,
+        predecessor_binding_id: str | None = None,
+        binding_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an immutable-generation Bee/conversation -> Notion thread binding.
+
+        Ownership is (account_key, workspace_id, conversation/remote_thread) + generation.
+        A bare remote_thread_id is never treated as a unique ownership key.
+        """
+        account = str(account_key or "").strip()
+        workspace = str(workspace_id or "").strip()
+        conversation = str(conversation_id or "").strip()
+        remote_thread = str(remote_thread_id or "").strip()
+        if not account or not workspace or not conversation or not remote_thread:
+            raise ValueError(
+                "account_key, workspace_id, conversation_id, and remote_thread_id are required"
+            )
+        now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(binding_generation), 0) AS max_gen
+                FROM conversation_bindings
+                WHERE account_key=? AND workspace_id=? AND conversation_id=?
+                """,
+                (account, workspace, conversation),
+            ).fetchone()
+            generation = int(row["max_gen"] or 0) + 1
+            active = conn.execute(
+                """
+                SELECT binding_id FROM conversation_bindings
+                WHERE account_key=? AND workspace_id=? AND conversation_id=? AND status='active'
+                """,
+                (account, workspace, conversation),
+            ).fetchone()
+            if active is not None:
+                raise ValueError(
+                    "conversation already has an active binding; retire it before creating a successor"
+                )
+            resolved_binding_id = str(binding_id or uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO conversation_bindings(
+                  binding_id, bee_id, hive_id, lane_id, assignment_id, conversation_id,
+                  account_key, workspace_id, notion_user_id, remote_thread_id,
+                  binding_generation, status, predecessor_binding_id, successor_binding_id,
+                  created_at, retired_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'active',?,NULL,?,NULL)
+                """,
+                (
+                    resolved_binding_id,
+                    bee_id,
+                    hive_id,
+                    lane_id,
+                    assignment_id,
+                    conversation,
+                    account,
+                    workspace,
+                    notion_user_id,
+                    remote_thread,
+                    generation,
+                    predecessor_binding_id,
+                    now,
+                ),
+            )
+            if predecessor_binding_id:
+                conn.execute(
+                    """
+                    UPDATE conversation_bindings
+                    SET successor_binding_id=?
+                    WHERE binding_id=? AND account_key=? AND workspace_id=?
+                    """,
+                    (resolved_binding_id, predecessor_binding_id, account, workspace),
+                )
+            conn.commit()
+            created = conn.execute(
+                "SELECT * FROM conversation_bindings WHERE binding_id=?",
+                (resolved_binding_id,),
+            ).fetchone()
+            return dict(created) if created else {"binding_id": resolved_binding_id}
+
+    def get_active_conversation_binding(
+        self,
+        *,
+        conversation_id: str,
+        account_key: str,
+        workspace_id: str,
+    ) -> dict[str, Any] | None:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM conversation_bindings
+                WHERE account_key=? AND workspace_id=? AND conversation_id=? AND status='active'
+                ORDER BY binding_generation DESC
+                LIMIT 1
+                """,
+                (str(account_key), str(workspace_id), str(conversation_id)),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def retire_conversation_binding(
+        self,
+        binding_id: str,
+        *,
+        account_key: str,
+        workspace_id: str,
+        successor_binding_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE conversation_bindings
+                SET status='retired', retired_at=?, successor_binding_id=COALESCE(?, successor_binding_id)
+                WHERE binding_id=? AND account_key=? AND workspace_id=? AND status='active'
+                """,
+                (now, successor_binding_id, binding_id, account_key, workspace_id),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM conversation_bindings WHERE binding_id=?",
+                (binding_id,),
+            ).fetchone()
+            return dict(row) if row else None
 
     def conversation_exists(self, conversation_id: str) -> bool:
         if not conversation_id:
@@ -1717,15 +2049,13 @@ async def compress_sliding_window_round(
             ]
 
         if not is_summarizer_configured():
-            logger.warning(
+            log_compression_warning(
+                logger,
                 "Skipping compression because summarizer is not configured",
-                extra={
-                    "request_info": {
-                        "event": "sliding_window_compress_skipped_no_summarizer",
-                        "conversation_id": conversation_id,
-                        "round_number": round_number,
-                    }
-                },
+                event="sliding_window_compress_skipped_no_summarizer",
+                conversation_id=conversation_id,
+                round_number=round_number,
+                prior_summary_count=len(old_summaries),
             )
             # text
             with manager._get_conn() as conn:
@@ -1746,22 +2076,27 @@ async def compress_sliding_window_round(
             str(round_row["assistant_thinking"] or ""),
         )
 
+        record_compression_event(
+            "sliding_window_compress_attempt",
+            conversation_id=conversation_id,
+            round_number=round_number,
+            prior_summary_count=len(old_summaries),
+            input_chars=len(user_content) + len(assistant_content),
+        )
         try:
             summary_text = await summarize_turn(
                 old_summaries=old_summaries,
                 user_msg=user_content,
                 assistant_msg=assistant_content,
             )
-        except SummarizerUnavailableError:
-            logger.warning(
+        except SummarizerUnavailableError as exc:
+            log_compression_warning(
+                logger,
                 "Compression summary unavailable",
-                extra={
-                    "request_info": {
-                        "event": "sliding_window_compress_summary_unavailable",
-                        "conversation_id": conversation_id,
-                        "round_number": round_number,
-                    }
-                },
+                event="sliding_window_compress_summary_unavailable",
+                conversation_id=conversation_id,
+                round_number=round_number,
+                reason=f"{type(exc).__name__}: {exc}",
             )
             # text
             with manager._get_conn() as conn:
@@ -1854,6 +2189,13 @@ async def compress_sliding_window_round(
             )
             conn.commit()
 
+        record_compression_event(
+            "sliding_window_compress_success",
+            conversation_id=conversation_id,
+            round_number=round_number,
+            summary_chars=len(summary_text),
+            input_chars=len(user_content) + len(assistant_content),
+        )
         logger.info(
             "Sliding window round compressed successfully",
             extra={
@@ -2041,34 +2383,40 @@ async def compress_round_if_needed(manager: ConversationManager, conversation_id
                 }
 
             if not is_summarizer_configured():
-                logger.warning(
+                log_compression_warning(
+                    logger,
                     "Skipping compression because summarizer is not configured",
-                    extra={
-                        "request_info": {
-                            "event": "conversation_compress_skipped_no_summarizer",
-                            "conversation_id": conversation_id,
-                            "message_count": message_count,
-                        }
-                    },
+                    event="conversation_compress_skipped_no_summarizer",
+                    conversation_id=conversation_id,
+                    message_count=message_count,
+                    input_chars=len(candidate["user_content"])
+                    + len(candidate["assistant_content"]),
                 )
                 return
 
+            record_compression_event(
+                "conversation_compress_attempt",
+                conversation_id=conversation_id,
+                round_index=candidate["round_index"],
+                message_count=message_count,
+                prior_summary_count=len(old_summaries),
+                input_chars=len(candidate["user_content"])
+                + len(candidate["assistant_content"]),
+            )
             try:
                 summary_text = await summarize_turn(
                     old_summaries=old_summaries,
                     user_msg=candidate["user_content"],
                     assistant_msg=candidate["assistant_content"],
                 )
-            except SummarizerUnavailableError:
-                logger.warning(
+            except SummarizerUnavailableError as exc:
+                log_compression_warning(
+                    logger,
                     "Compression summary unavailable; active messages retained",
-                    extra={
-                        "request_info": {
-                            "event": "conversation_compress_summary_unavailable",
-                            "conversation_id": conversation_id,
-                            "round_index": candidate["round_index"],
-                        }
-                    },
+                    event="conversation_compress_summary_unavailable",
+                    conversation_id=conversation_id,
+                    round_index=candidate["round_index"],
+                    reason=f"{type(exc).__name__}: {exc}",
                 )
                 return
             except Exception:
@@ -2183,7 +2531,20 @@ async def compress_round_if_needed(manager: ConversationManager, conversation_id
                         (conversation_id,),
                     )
                     conn.commit()
+                record_compression_event(
+                    "conversation_compress_success",
+                    conversation_id=conversation_id,
+                    round_index=candidate["round_index"],
+                    summary_chars=len(summary_text),
+                    input_chars=len(candidate["user_content"])
+                    + len(candidate["assistant_content"]),
+                    remaining_message_count=max(0, current_message_count - 2),
+                )
     except Exception:
+        record_compression_event(
+            "conversation_compress_task_crashed",
+            conversation_id=conversation_id,
+        )
         logger.error(
             "compress_round_if_needed crashed",
             exc_info=True,
@@ -2223,7 +2584,8 @@ def build_lite_transcript(user_prompt: str, model_name: str) -> list[dict[str, A
 
 
 _NOTION_TASK_INSTRUCTIONS = {
-    "visualize": "Create the requested interactive HTML visualization or visual artifact.",
+    "visualize": "Create the requested interactive HTML or data visualization; do not treat this as image generation.",
+    "generate_image": "Create or edit the requested image using Notion Agent image-generation capabilities.",
     "create_slides": "Create the requested presentation or slide deck artifact.",
     "spreadsheet": "Use spreadsheet and data-analysis capabilities for this request.",
     "deep_research": "Conduct broad, thorough research across the selected sources and produce a sourced result.",
@@ -2245,6 +2607,7 @@ def apply_notion_ai_options(
     web_access: bool | None = None,
     persona: str | None = None,
     instructions: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> list[dict[str, Any]]:
     """Apply Notion AI home controls to transcript config blocks."""
     source_aliases = {"all": "everything", "notion-help-center": "helpdocs"}
@@ -2266,15 +2629,19 @@ def apply_notion_ai_options(
         if block.get("type") not in {"config", "updated-config"} or not isinstance(block.get("value"), dict):
             continue
         value = block["value"]
+        if reasoning_effort:
+            value["reasoningEffort"] = reasoning_effort
+        else:
+            value.pop("reasoningEffort", None)
         research = mode == "research" or task == "deep_research"
         value["useReadOnlyMode"] = mode == "ask"
         value["isAgentResearchRequest"] = research
         if research:
             value["enableScriptAgent"] = True
-        if task in {"visualize", "create_slides", "spreadsheet"}:
+        if task in {"visualize", "generate_image", "create_slides", "spreadsheet"}:
             value["enableScriptAgent"] = True
             value["enableComputer"] = True
-        if task == "create_slides":
+        if task in {"generate_image", "create_slides"}:
             value["enableAgentGenerateImage"] = True
         if task == "spreadsheet":
             value["enableCsvAttachmentSupport"] = True
@@ -2291,6 +2658,21 @@ def apply_notion_ai_options(
         if instruction_parts:
             existing = str(value.get("ephemeralInstructions") or "").strip()
             value["ephemeralInstructions"] = "\n".join(([existing] if existing else []) + instruction_parts)
+
+    if task == "generate_image":
+        # Notion's native image-generation UI sends the latest prompt as an
+        # agent-prebuilt-prompt in image_generation_mode, not as a generic
+        # user step. Preserve the prompt value and identity fields while
+        # matching that native transcript contract.
+        for block in reversed(transcript):
+            if block.get("type") != "user":
+                continue
+            block["type"] = "agent-prebuilt-prompt"
+            block["args"] = {"type": "image_generation_mode"}
+            block["promptType"] = "image_generation_mode"
+            block["locale"] = "en-US"
+            block["isEdited"] = False
+            break
     return transcript
 
 

@@ -37,6 +37,10 @@ class ChatCompletionRequest(BaseModel):
       content across message preparation, persistence, and upstream dispatch.
     """
     model: str = Field(default="terra", description="Requested model. Defaults to the consumer-friendly Terra alias.")
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description="Exact Notion reasoning effort. Omit to use the selected model default.",
+    )
     messages: List[ChatMessage]
     stream: bool = Field(default=False, description="Whether to stream the response as SSE.")
     temperature: Optional[float] = Field(default=None, description="Sampling temperature.")
@@ -56,9 +60,9 @@ class ChatCompletionRequest(BaseModel):
         default="default",
         description="Notion AI execution mode.",
     )
-    notion_task: Optional[Literal["visualize", "create_slides", "spreadsheet", "deep_research"]] = Field(
+    notion_task: Optional[Literal["visualize", "generate_image", "create_slides", "spreadsheet", "deep_research"]] = Field(
         default=None,
-        description="Notion AI full-page prompt category.",
+        description="Notion AI task category; image generation is distinct from data/HTML visualization.",
     )
     notion_sources: Optional[List[NotionSource]] = Field(
         default=None,

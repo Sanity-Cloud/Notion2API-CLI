@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import tempfile
 import time
 import uuid
 from difflib import SequenceMatcher
@@ -27,12 +28,17 @@ from app.conversation import (
 )
 from app.config import is_lite_mode
 from app.logger import logger
+from app.diagnostics import emit_diagnostic_event
+from app.model_catalog import ModelCatalogUnavailable, ModelSelectionError
 from app.model_registry import (
     get_model_route_resolution,
     is_supported_model,
     list_available_models,
+    resolve_model_selection,
 )
 from app.notion_client import NotionUpstreamError
+from app.request_control import controlled_chat_request
+from app.retry_policy import should_retry_upstream
 from app.attachments.normalizer import (
     PromptValidationError,
     normalize_chat_messages,
@@ -43,6 +49,10 @@ from app.attachments.security import AttachmentPolicy
 from app.attachments.errors import AttachmentError
 from app.output_integrity import assess_output_integrity
 from app.retry_policy import bounded_provider_attempts
+from app.stream_protocol import (
+    StreamProtocolTracker,
+    StreamSourceCleanupError,
+)
 from app.output_hygiene import (
     detect_visible_output_contamination,
     finalize_visible_output,
@@ -62,6 +72,69 @@ from app.hive_bee_call import validate_bee_notion_call
 from app.hive_multithread import MultithreadContractError
 
 router = APIRouter()
+
+
+def _record_notion_upstream_diagnostic(
+    *,
+    mode: str,
+    exc: NotionUpstreamError,
+    attempt: int,
+    max_retries: int,
+) -> None:
+    excerpt = str(getattr(exc, "response_excerpt", "") or "")
+    missing_finished_at = "missing_finishedAt" in excerpt
+    emit_diagnostic_event(
+        code="NOTION_MISSING_FINISHED_AT" if missing_finished_at else "NOTION_UPSTREAM_ERROR",
+        message=(
+            "Notion stream ended without recognized completion metadata."
+            if missing_finished_at
+            else "Notion upstream request failed."
+        ),
+        operation=f"chat_{mode}_upstream",
+        category="upstream_provider",
+        severity="error",
+        kind="protocol_completion_failure" if missing_finished_at else "upstream_error",
+        retryable=bool(getattr(exc, "retriable", False)),
+        details={
+            "mode": mode,
+            "attempt": attempt,
+            "max_retries": max_retries,
+            "status_code": getattr(exc, "status_code", None),
+            "retriable": bool(getattr(exc, "retriable", False)),
+            "diagnostic_marker": "missing_finishedAt" if missing_finished_at else "",
+        },
+    )
+
+
+def _record_chat_runtime_diagnostic(
+    *,
+    mode: str,
+    code: str,
+    operation: str,
+    attempt: int | None = None,
+    max_retries: int | None = None,
+    exception: BaseException | None = None,
+    retryable: bool = False,
+    severity: str = "error",
+    kind: str = "runtime_error",
+) -> None:
+    details: dict[str, Any] = {"mode": mode}
+    if attempt is not None:
+        details["attempt"] = attempt
+    if max_retries is not None:
+        details["max_retries"] = max_retries
+    if exception is not None:
+        details["exception_type"] = type(exception).__name__
+    emit_diagnostic_event(
+        code=code,
+        message=f"Notion2API {mode} workflow encountered {code.lower().replace('_', ' ')}.",
+        operation=operation,
+        category="application_runtime",
+        severity=severity,
+        kind=kind,
+        retryable=retryable,
+        details=details,
+    )
 
 
 def _enforce_bee_notion_call_contract(
@@ -159,6 +232,7 @@ def _apply_notion_request_options(
         web_access=req_body.web_access,
         persona=req_body.notion_persona,
         instructions=instructions,
+        reasoning_effort=req_body.reasoning_effort,
     )
 
 
@@ -454,46 +528,69 @@ def _resolve_request_model(
     model: str | None,
     workspace_selector: str = "",
 ) -> str:
+    del request, workspace_selector
     normalized_model = normalize_model_id(model)
     if not normalized_model:
         openai_error("The 'model' field is required.", "model_required")
-
-    restricted = set()
-    try:
-        pool = request.app.state.account_pool
-        client = (
-            pool.get_metadata_client_for_workspace(workspace_selector)
-            if workspace_selector
-            else pool.get_metadata_client()
-        )
-        from app.model_registry import get_restricted_models_for_space, get_notion_model
-
-        restricted = get_restricted_models_for_space(client)
-        notion_model = get_notion_model(normalized_model)
-        if notion_model in restricted or normalized_model in restricted:
-            openai_error(
-                f"Model '{normalized_model}' is unavailable for the current account due to restriction (e.g. trial_not_allowed).",
-                "model_restricted",
-                status_code=400,
-            )
-    except Exception as e:
-        if hasattr(e, "status_code"):
-            raise e
-
-    if not is_supported_model(normalized_model):
-        try:
-            available_models = [
-                m
-                for m in list_available_models()
-                if get_notion_model(m) not in restricted and m not in restricted
-            ]
-        except Exception:
-            available_models = list_available_models()
-        openai_error(
-            f"Unsupported model '{normalized_model}'. Available models: {', '.join(available_models)}",
-            "model_not_found",
-        )
+    # The live Notion picker is authoritative. Static aliases remain useful for
+    # normalization, but an unknown value must reach catalog validation instead
+    # of silently resolving to Terra through the legacy registry fallback.
     return normalized_model
+
+
+def _validate_request_model_selection(
+    req_body: ChatCompletionRequest,
+    client: Any,
+) -> dict[str, Any]:
+    try:
+        selection = resolve_model_selection(
+            client,
+            str(req_body.model or ""),
+            req_body.reasoning_effort,
+            surface="workflow",
+        )
+    except ModelSelectionError as exc:
+        openai_error(
+            str(exc),
+            exc.code,
+            status_code=400,
+            param=exc.param,
+        )
+    except ModelCatalogUnavailable as exc:
+        openai_error(
+            str(exc),
+            "model_catalog_unavailable",
+            status_code=503,
+            param="model",
+        )
+
+    metadata = dict(req_body.metadata or {}) if isinstance(req_body.metadata, dict) else {}
+    model_metadata = selection.get("model_metadata")
+    receipt = {
+        key: value
+        for key, value in selection.items()
+        if key != "model_metadata"
+    }
+    if isinstance(model_metadata, dict):
+        receipt["model_metadata"] = {
+            key: model_metadata.get(key)
+            for key in (
+                "canonical_id",
+                "public_name",
+                "display_name",
+                "model_family",
+                "model_provider",
+                "display_group",
+                "model_card_attributes",
+                "routes",
+                "is_approaching_rate_limit",
+            )
+        }
+    metadata["model_selection"] = receipt
+    req_body.metadata = metadata
+    req_body.model = str(selection.get("canonical_id") or req_body.model)
+    req_body.reasoning_effort = selection.get("resolved_reasoning_effort") or None
+    return selection
 
 
 def _client_type_from_request(request: Request) -> str:
@@ -920,73 +1017,135 @@ def _parse_sse_json(chunk: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _build_stream_error_event(response_id: str, model: str, outcome: Any) -> str:
+    """Emit a terminal-safe SSE error receipt after a guarded stream failure."""
+    payload = {
+        "id": response_id,
+        "object": "error",
+        "model": model,
+        "error": {
+            "code": outcome.code or "ERR_STREAM_INTERRUPTED",
+            "type": outcome.classification or "stream_interrupted",
+            "message": "Upstream stream ended before a valid terminal receipt.",
+            "retriable": outcome.retriable,
+        },
+        "stream_receipt": outcome.receipt,
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _close_stream_source(
+    source: Iterable[Any],
+) -> tuple[bool, StreamSourceCleanupError | None]:
+    close = getattr(source, "close", None)
+    if not callable(close):
+        return False, None
+    try:
+        close()
+    except Exception as exc:
+        logger.warning(
+            "Failed to close upstream stream",
+            exc_info=True,
+            extra={
+                "request_info": {
+                    "event": "stream_source_close_failed",
+                    "cleanup_error_type": type(exc).__name__,
+                }
+            },
+        )
+        return True, StreamSourceCleanupError.from_exception(exc)
+    return True, None
+
+
 def _guard_stream_until_integrity(
     source: Iterable[str],
     *,
     response_id: str,
     model: str,
 ) -> Generator[str, None, None]:
-    """Buffer provider SSE until final integrity classification is known.
+    """Buffer provider SSE until final integrity and terminal framing are known.
 
     A final-only quarantine cannot retract deltas already delivered to clients.
     This guard therefore withholds provider output until the stream reaches a
     terminal integrity decision. Local probe streams do not use this wrapper.
     """
-    buffered: list[str] = []
     metadata_events: list[str] = []
     hygiene_events: list[str] = []
-    total_chars = 0
     quarantined = False
-    forced_limit = False
+    tracker = StreamProtocolTracker()
+    source_error: BaseException | None = None
+    cleanup_attempted = False
+    cleanup_error: StreamSourceCleanupError | None = None
+    propagating = False
 
-    for raw_chunk in source:
-        chunk = str(raw_chunk)
-        total_chars += len(chunk)
-        if not forced_limit and total_chars <= MAX_GUARDED_STREAM_BUFFER_CHARS:
-            buffered.append(chunk)
-        else:
-            forced_limit = True
-            buffered.clear()
+    with tempfile.SpooledTemporaryFile(
+        max_size=MAX_GUARDED_STREAM_BUFFER_CHARS,
+        mode="w+b",
+    ) as buffered:
+        try:
+            for raw_chunk in source:
+                chunk = str(raw_chunk)
+                tracker.observe(chunk)
+                encoded = chunk.encode("utf-8")
+                buffered.write(len(encoded).to_bytes(8, "big"))
+                buffered.write(encoded)
 
-        payload = _parse_sse_json(chunk)
-        if payload is None:
-            continue
-        event_type = str(payload.get("type") or "")
-        if event_type == "model_metadata":
-            metadata_events.append(chunk)
-        if event_type == "output_hygiene":
-            hygiene_events.append(chunk)
-            hygiene = payload.get("hygiene")
-            if isinstance(hygiene, dict) and _output_requires_quarantine(hygiene):
-                quarantined = True
+                payload = _parse_sse_json(chunk)
+                if payload is None:
+                    continue
+                event_type = str(payload.get("type") or "")
+                if event_type == "model_metadata":
+                    metadata_events.append(chunk)
+                if event_type == "output_hygiene":
+                    hygiene_events.append(chunk)
+                    hygiene = payload.get("hygiene")
+                    if isinstance(hygiene, dict) and _output_requires_quarantine(hygiene):
+                        quarantined = True
 
-        choices = payload.get("choices")
-        if isinstance(choices, list) and choices:
-            choice = choices[0] if isinstance(choices[0], dict) else {}
-            if choice.get("finish_reason") == "content_filter":
-                quarantined = True
+                choices = payload.get("choices")
+                if isinstance(choices, list) and choices:
+                    choice = choices[0] if isinstance(choices[0], dict) else {}
+                    if choice.get("finish_reason") == "content_filter":
+                        quarantined = True
+        except asyncio.CancelledError:
+            propagating = True
+            raise
+        except GeneratorExit:
+            propagating = True
+            raise
+        except Exception as exc:
+            source_error = exc
+        finally:
+            cleanup_attempted, cleanup_error = _close_stream_source(source)
+            if source_error is None and cleanup_error is not None and not propagating:
+                source_error = cleanup_error
 
-    if forced_limit:
-        hygiene = {
-            "output_integrity": assess_output_integrity(
-                "",
-                additional_reasons=("guarded_stream_buffer_limit_exceeded",),
-            )
-        }
-        yield from metadata_events
-        yield _build_hygiene_metadata_event(hygiene)
-        yield _build_stream_chunk(response_id, model, finish_reason="content_filter")
-        yield "data: [DONE]\n\n"
-        return
+        outcome = tracker.finalize(
+            source_error=source_error,
+            cleanup_attempted=cleanup_attempted,
+            cleanup_error=cleanup_error,
+        )
 
-    if quarantined:
-        yield from metadata_events
-        yield from hygiene_events
-        yield _build_stream_chunk(response_id, model, finish_reason="content_filter")
-        yield "data: [DONE]\n\n"
-        return
+        if quarantined:
+            yield from metadata_events
+            yield from hygiene_events
+            yield _build_stream_chunk(response_id, model, finish_reason="content_filter")
+            yield "data: [DONE]\n\n"
+            return
 
-    yield from buffered
+        if not outcome.ok:
+            yield from metadata_events
+            yield _build_stream_error_event(response_id, model, outcome)
+            yield _build_stream_chunk(response_id, model, finish_reason="error")
+            return
+
+        buffered.seek(0)
+        while True:
+            length_bytes = buffered.read(8)
+            if not length_bytes:
+                break
+            chunk_length = int.from_bytes(length_bytes, "big")
+            yield buffered.read(chunk_length).decode("utf-8")
 
 
 def _emit_visible_stream_correction(
@@ -1277,6 +1436,28 @@ def _response_model_metadata(
                 "aligned",
             }
         }
+
+    selection = (
+        request_metadata.get("model_selection")
+        if isinstance(request_metadata, dict)
+        else None
+    )
+    if isinstance(selection, dict):
+        payload["model_selection"] = dict(selection)
+        for key in (
+            "requested_reasoning_effort",
+            "resolved_reasoning_effort",
+            "reasoning_effort_source",
+            "supported_reasoning_efforts",
+            "default_reasoning_effort",
+            "catalog_source",
+            "catalog_snapshot_sha256",
+            "catalog_fetched_at",
+            "catalog_age_seconds",
+            "catalog_stale",
+        ):
+            if key in selection:
+                payload.setdefault(key, selection[key])
 
     caller = (
         request_metadata.get("caller") if isinstance(request_metadata, dict) else None
@@ -1843,6 +2024,14 @@ def _create_lite_stream_generator(
                 extra={"request_info": {"event": "lite_stream_client_disconnected"}},
             )
             return
+        _record_chat_runtime_diagnostic(
+            mode="lite_stream",
+            code="STREAM_INTERRUPTED",
+            operation="chat_lite_stream",
+            exception=exc,
+            retryable=True,
+            kind="stream_failure",
+        )
         logger.error(
             "Lite streaming interrupted",
             exc_info=True,
@@ -2005,6 +2194,14 @@ def _create_standard_stream_generator(
                 },
             )
             return
+        _record_chat_runtime_diagnostic(
+            mode="standard_stream",
+            code="STREAM_INTERRUPTED",
+            operation="chat_standard_stream",
+            exception=exc,
+            retryable=True,
+            kind="stream_failure",
+        )
         logger.error(
             "Standard streaming interrupted",
             exc_info=True,
@@ -2198,6 +2395,7 @@ def _handle_lite_request(
         client = None
         try:
             client = _client_for_requested_workspace(pool, req_body)
+            _validate_request_model_selection(req_body, client)
             _bind_governance_request_metadata(req_body, client)
 
             # Read poll configuration from headers if available
@@ -2363,6 +2561,9 @@ def _handle_lite_request(
             return response_obj
 
         except NotionUpstreamError as exc:
+            _record_notion_upstream_diagnostic(
+                mode="lite", exc=exc, attempt=attempt, max_retries=max_retries
+            )
             if client is not None and exc.retriable:
                 pool.mark_failed(client)
             logger.warning(
@@ -2378,9 +2579,21 @@ def _handle_lite_request(
                     }
                 },
             )
-            if attempt == max_retries or not exc.retriable:
+            if not should_retry_upstream(
+                retriable=exc.retriable, attempt=attempt, max_attempts=max_retries
+            ):
                 return _upstream_error_response(exc)
         except RuntimeError as exc:
+            _record_chat_runtime_diagnostic(
+                mode="lite",
+                code="ACCOUNT_POOL_UNAVAILABLE",
+                operation="chat_lite_account_selection",
+                attempt=attempt,
+                max_retries=max_retries,
+                exception=exc,
+                retryable=True,
+                kind="capacity_or_cooling",
+            )
             logger.error(
                 "Lite mode: No available client in account pool",
                 extra={
@@ -2398,6 +2611,16 @@ def _handle_lite_request(
                 suggestion="Retry later.",
             )
         except AttachmentError as exc:
+            _record_chat_runtime_diagnostic(
+                mode="lite",
+                code="ATTACHMENT_VALIDATION_FAILED",
+                operation="chat_lite_attachment_validation",
+                attempt=attempt,
+                max_retries=max_retries,
+                exception=exc,
+                severity="warning",
+                kind="input_validation",
+            )
             logger.warning(
                 "Lite mode: Invalid attachment input",
                 extra={
@@ -2411,7 +2634,17 @@ def _handle_lite_request(
             return _attachment_error_response(exc)
         except HTTPException:
             raise
-        except Exception:
+        except Exception as exc:
+            _record_chat_runtime_diagnostic(
+                mode="lite",
+                code="UNHANDLED_CHAT_EXCEPTION",
+                operation="chat_lite_completion",
+                attempt=attempt,
+                max_retries=max_retries,
+                exception=exc,
+                retryable=attempt < max_retries,
+                kind="exception",
+            )
             if client is not None:
                 pool.mark_failed(client)
             logger.error(
@@ -2536,6 +2769,7 @@ def _handle_standard_request(
                 )
             else:
                 client = _client_for_requested_workspace(pool, req_body)
+            _validate_request_model_selection(req_body, client)
             _bind_governance_request_metadata(req_body, client)
             if manager and conversation_id:
                 _enforce_bee_notion_call_contract(
@@ -2746,6 +2980,9 @@ def _handle_standard_request(
             return response_obj
 
         except NotionUpstreamError as exc:
+            _record_notion_upstream_diagnostic(
+                mode="standard", exc=exc, attempt=attempt, max_retries=max_retries
+            )
             if client is not None and exc.retriable:
                 pool.mark_failed(client)
             logger.warning(
@@ -2761,9 +2998,21 @@ def _handle_standard_request(
                     }
                 },
             )
-            if attempt == max_retries or not exc.retriable:
+            if not should_retry_upstream(
+                retriable=exc.retriable, attempt=attempt, max_attempts=max_retries
+            ):
                 return _upstream_error_response(exc)
         except RuntimeError as exc:
+            _record_chat_runtime_diagnostic(
+                mode="standard",
+                code="ACCOUNT_POOL_UNAVAILABLE",
+                operation="chat_standard_account_selection",
+                attempt=attempt,
+                max_retries=max_retries,
+                exception=exc,
+                retryable=True,
+                kind="capacity_or_cooling",
+            )
             logger.error(
                 "Standard mode: No available client in account pool",
                 extra={
@@ -2781,6 +3030,16 @@ def _handle_standard_request(
                 suggestion="Retry later.",
             )
         except AttachmentError as exc:
+            _record_chat_runtime_diagnostic(
+                mode="standard",
+                code="ATTACHMENT_VALIDATION_FAILED",
+                operation="chat_standard_attachment_validation",
+                attempt=attempt,
+                max_retries=max_retries,
+                exception=exc,
+                severity="warning",
+                kind="input_validation",
+            )
             logger.warning(
                 "Standard mode: Invalid attachment input",
                 extra={
@@ -2794,7 +3053,17 @@ def _handle_standard_request(
             return _attachment_error_response(exc)
         except HTTPException:
             raise
-        except Exception:
+        except Exception as exc:
+            _record_chat_runtime_diagnostic(
+                mode="standard",
+                code="UNHANDLED_CHAT_EXCEPTION",
+                operation="chat_standard_completion",
+                attempt=attempt,
+                max_retries=max_retries,
+                exception=exc,
+                retryable=attempt < max_retries,
+                kind="exception",
+            )
             if client is not None:
                 pool.mark_failed(client)
             logger.error(
@@ -2826,6 +3095,7 @@ def _handle_standard_request(
 
 
 @router.post("/chat/completions", tags=["chat"])
+@controlled_chat_request
 async def create_chat_completion(
     request: Request,
     req_body: ChatCompletionRequest,
@@ -3126,6 +3396,7 @@ async def create_chat_completion(
             client = _client_for_conversation(
                 pool, manager, conversation_id, req_body
             )
+            _validate_request_model_selection(req_body, client)
             _bind_governance_request_metadata(req_body, client)
             _enforce_bee_notion_call_contract(
                 manager=manager,
@@ -3514,6 +3785,20 @@ async def create_chat_completion(
                     )
                     quarantined = _output_requires_quarantine(hygiene_meta)
                     if quarantined:
+                        emit_diagnostic_event(
+                            code="OUTPUT_CONTAMINATED",
+                            message="Notion2API quarantined a contaminated streaming response.",
+                            operation="chat_stream_output_integrity",
+                            category="output_integrity",
+                            severity="error",
+                            kind="quarantined_output",
+                            retryable=False,
+                            details={
+                                "mode": "full_stream",
+                                "normal_persistence_blocked": True,
+                                "output_integrity": hygiene_meta.get("output_integrity"),
+                            },
+                        )
                         logger.error(
                             "Quarantined contaminated streaming response",
                             extra={
@@ -3538,7 +3823,15 @@ async def create_chat_completion(
                                 final_reply,
                                 persisted_thinking,
                             )
-                        except Exception:
+                        except Exception as exc:
+                            _record_chat_runtime_diagnostic(
+                                mode="full_stream",
+                                code="CONVERSATION_PERSIST_FAILED",
+                                operation="persist_conversation_round",
+                                exception=exc,
+                                retryable=True,
+                                kind="persistence_failure",
+                            )
                             logger.error(
                                 "Failed to persist conversation round",
                                 exc_info=True,
@@ -3708,6 +4001,9 @@ async def create_chat_completion(
             _attach_response_hygiene(response_obj, hygiene_meta)
             return response_obj
         except NotionUpstreamError as exc:
+            _record_notion_upstream_diagnostic(
+                mode="full", exc=exc, attempt=attempt, max_retries=max_retries
+            )
             if client is not None and exc.retriable:
                 pool.mark_failed(client)
             logger.warning(
@@ -3724,9 +4020,21 @@ async def create_chat_completion(
                     }
                 },
             )
-            if attempt == max_retries or not exc.retriable:
+            if not should_retry_upstream(
+                retriable=exc.retriable, attempt=attempt, max_attempts=max_retries
+            ):
                 return _upstream_error_response(exc)
         except RuntimeError as exc:
+            _record_chat_runtime_diagnostic(
+                mode="full",
+                code="ACCOUNT_POOL_UNAVAILABLE",
+                operation="chat_full_account_selection",
+                attempt=attempt,
+                max_retries=max_retries,
+                exception=exc,
+                retryable=True,
+                kind="capacity_or_cooling",
+            )
             logger.error(
                 "No available client in account pool",
                 extra={
@@ -3744,6 +4052,16 @@ async def create_chat_completion(
                 suggestion="Retry later.",
             )
         except AttachmentError as exc:
+            _record_chat_runtime_diagnostic(
+                mode="full",
+                code="ATTACHMENT_VALIDATION_FAILED",
+                operation="chat_full_attachment_validation",
+                attempt=attempt,
+                max_retries=max_retries,
+                exception=exc,
+                severity="warning",
+                kind="input_validation",
+            )
             logger.warning(
                 "Invalid attachment input",
                 extra={
@@ -3757,7 +4075,17 @@ async def create_chat_completion(
             return _attachment_error_response(exc)
         except HTTPException:
             raise
-        except Exception:
+        except Exception as exc:
+            _record_chat_runtime_diagnostic(
+                mode="full",
+                code="UNHANDLED_CHAT_EXCEPTION",
+                operation="chat_full_completion",
+                attempt=attempt,
+                max_retries=max_retries,
+                exception=exc,
+                retryable=attempt < max_retries,
+                kind="exception",
+            )
             if client is not None:
                 pool.mark_failed(client)
             logger.error(

@@ -379,6 +379,10 @@ def test_shared_weight_bucket_uses_exact_fixed_point_boundaries(
             admission_weight=0.25,
         )
 
+    # This assertion targets fixed-point consumption, not elapsed-time refill.
+    # Freeze the shared store's wall clock so a loaded test host cannot add one
+    # or more refill units while the eight acquisitions are running.
+    monkeypatch.setattr("app.notion_admission_store.time.time", lambda: 1_900_000_000.0)
     database = tmp_path / "fixed-point.sqlite3"
     controller = NotionAdmissionController(
         shared_store=SharedAdmissionStore(database)
@@ -406,3 +410,30 @@ def test_shared_weight_bucket_uses_exact_fixed_point_boundaries(
             operation="fractional-overflow",
             admission_weight=0.25,
         )
+
+
+def test_successful_shared_admission_is_not_rejected_by_local_bookkeeping_latency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configure(monkeypatch)
+    monkeypatch.setenv("NOTION_ADMISSION_QUEUE_TIMEOUT_SECONDS", "0.05")
+    controller = NotionAdmissionController(
+        shared_store=SharedAdmissionStore(tmp_path / "latency.sqlite3")
+    )
+    clock = {"value": 0.0}
+    monkeypatch.setattr(controller, "_clock", lambda: clock["value"])
+
+    def granted_shared_lease(**_kwargs):
+        clock["value"] = 0.10
+        return "", 0, 0, 0.0
+
+    monkeypatch.setattr(controller, "_acquire_shared", granted_shared_lease)
+
+    permit = controller.acquire(
+        workspace_id="workspace-a",
+        user_id="user-a",
+        operation="already-shared-admitted",
+    )
+
+    assert permit.receipt.disposition == "admitted"
+    controller.release(permit, success=True)

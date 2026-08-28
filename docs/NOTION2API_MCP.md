@@ -1,4 +1,4 @@
-﻿# Notion2API MCP server
+# Notion2API MCP server
 
 This repo includes a thin MCP wrapper around the existing Notion2API HTTP API. The wrapper does not replace the OpenAI-compatible `/v1` API; it runs as a separate MCP server and forwards tool calls to a local Notion2API backend.
 
@@ -47,6 +47,7 @@ ChatGPT custom connectors expect an MCP endpoint. For local development, expose 
 
 - `notion2api_health`
 - `notion2api_list_models`
+- `notion2api_chat_history`
 - `notion2api_chat`
 - `notion2api_chat_completion`
 - `notion2api_responses`
@@ -58,9 +59,38 @@ ChatGPT custom connectors expect an MCP endpoint. For local development, expose 
 - `notion2api_reset_session`
 - `notion2api_rename_session`
 
+### Grouped chat-history tool
+
+`notion2api_chat_history` exposes eight governed actions through one typed tool: `status`, `list_threads`, `get_thread`, `search`, `export_markdown`, `model_stats`, `sync_from_notion`, and `hydrate_thread`.
+
+List and search actions use bounded `limit` and `offset` pagination. Thread reads cap returned messages and process steps with `message_limit`; Markdown export is capped with `content_limit`. Every successful dispatch includes whitelisted account, workspace, teamspace, and governance provenance. Account emails, user IDs, raw credentials, destructive deletion, cleanup, raw-debug export, and arbitrary local database mutation are not exposed.
+
+`sync_from_notion` and `hydrate_thread` are non-destructive, idempotent archive operations. They require an explicit zero-based `account_index` and return partial-result receipts when the backend reports failed sub-operations.
+
+
+## Client-visible contract snapshots
+
+The reviewed MCP schemas are stored separately for the two runtime profiles:
+
+- `contracts/mcp/notion2api.json` ? plain Notion2API profile, currently 48 tools.
+- `contracts/mcp/aigentbee.json` ? AIgentBee-prefixed profile, currently 51 tools, including the three conditional swarm-workbench tools.
+
+The snapshots freeze tool names, descriptions, input and output schemas, required fields, defaults, enum values, annotations, profile-specific metadata, and server instructions. Regenerate them only after reviewing an intentional client-visible change:
+
+```powershell
+python scripts/generate_mcp_contract_snapshots.py
+python -m pytest -q tests/test_mcp_contract_snapshots.py
+```
+
+A process restart is required before a running MCP server advertises changed schemas. Existing ChatGPT or other connector sessions may also retain a stale tool cache and require reconnection or refresh; snapshot validation does not prove that a live client has refreshed.
+
+Current annotation coverage is incomplete for legacy tools. The snapshots preserve that fact as reviewed baseline evidence rather than assigning unverified read-only, destructive, or idempotency semantics. New or changed tools should declare explicit annotations, and a separate governance audit should classify legacy operations before clients rely on annotation-driven authorization.
+
 ## Models, sessions, and continuation
 
 The default requested model is the consumer-facing `terra` alias, which resolves to the current Terra backend route. `sol`, `terra`, and `luna` are accepted alongside the longer public model names and canonical Notion route IDs.
+
+`notion2api_list_models` reads the workspace-global live Notion picker and returns per-model reasoning efforts, the default effort, ratings, restrictions, surface routes, and a catalog freshness receipt. Chat tools accept an exact optional `reasoning_effort`; omission uses the selected model's catalog default, while unsupported values fail closed without model or effort substitution.
 
 Omitting `session_name` creates a descriptive generated session name for new work. The legacy literal `op` is normalized the same way, preventing stale clients from adding new work to the old shared session.
 
@@ -72,7 +102,9 @@ Continue an existing chat with any authoritative identifier:
 
 The model may change on a later turn without changing the local conversation or remote Notion chat. Results expose the local `conversation_id`, the durable `remote_chat_id`/`notion_thread_id`, and the pollable `request_id`.
 
-Chat requests return `pending` immediately. Poll `notion2api_get_chat_job` for the visible response, bounded activity summary, checklist/task state, poll count, and stall indicators. Raw private reasoning is not persisted. A stalled job reports `dead_loop_suspected` and `cancel_recommended`; cancel it explicitly with `notion2api_cancel_chat_job` or set `cancel_if_stalled=true` while polling.
+Chat requests return `pending` immediately. Poll `notion2api_get_chat_job` for the visible response, bounded activity summary, checklist/task state, poll count, and stall indicators. Raw private reasoning is not persisted. A process-local watchdog also reconciles active jobs and persists bounded monitoring state even when no client is polling. A stalled job reports `dead_loop_suspected` and `cancel_recommended`; cancel it explicitly with `notion2api_cancel_chat_job` or set `cancel_if_stalled=true` while polling.
+
+Cancellation is deliberately fail-closed. Cancelling an MCP job records the local task cancellation request, the pre-cancel stall evidence, and `reconciliation_required=true` while the upstream Notion outcome is unconfirmed. Local `asyncio` cancellation is **not** represented as proof that Notion stopped. If a terminal assistant turn is observed later, the job remains `cancelled` but records `late_completion_detected=true`, `upstream_execution_state=terminal`, and clears the reconciliation gap. Cancelled, stale, errored, and quarantined jobs are not projected as authoritative answers. Do not start replacement mutation work while `reconciliation_required=true`.
 
 ## Notion AI modes, tasks, sources, and personalization
 
@@ -80,8 +112,9 @@ Chat requests return `pending` immediately. Poll `notion2api_get_chat_job` for t
 
 | Argument | Values | Behavior |
 | --- | --- | --- |
+| `reasoning_effort` | model-specific values from `notion2api_list_models`, or omitted | Sends the exact validated Notion effort; omission uses the live catalog default. |
 | `mode` | `default`, `ask`, `research` | `default` can search and edit; `ask` is read-only; `research` enables deeper research and web search by default. |
-| `task` | `visualize`, `create_slides`, `spreadsheet`, `deep_research` | Selects the matching Notion task preset and enables its artifact capabilities. |
+| `task` | `visualize`, `generate_image`, `create_slides`, `spreadsheet`, `deep_research` | Selects the matching Notion task preset. `visualize` is for interactive/data visualizations; `generate_image` enables Notion Agent image generation/editing. |
 | `sources` | list of source-scope strings | Restricts retrieval to selected sources. Common values are `all`, `notion`, `web`, `notion-help-center`, `github`, `gmail`, `google-calendar`, and `google-drive`. |
 | `web_access` | `true`, `false`, or omitted | Explicitly enables/disables web search; omitted uses the selected mode/source default. |
 | `persona` | `sidekick`, `minimalist`, `analyst` | Applies Notion's warm, concise, or structured response style for the request. |
